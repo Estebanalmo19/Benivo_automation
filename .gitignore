@@ -1,2 +1,6 @@
 .env
 .xlsx
+.json
+.env
+venv/
+.vscode/
