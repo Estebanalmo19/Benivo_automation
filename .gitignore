@@ -1,6 +1,11 @@
 .env
-.xlsx
-.json
-.env
 venv/
 .vscode/
+
+# Runtime artifacts (not source) -- generated report files and caches
+reports/*.xlsx
+benivo_insert_report.xlsx
+benivo_test_report.xlsx
+__pycache__/
+*.pyc
+.pytest_cache/
