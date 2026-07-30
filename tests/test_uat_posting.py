@@ -1,11 +1,15 @@
 import datetime
 from unittest.mock import MagicMock, patch
 
-import posting
+from app.services import posting_service as posting
 
 SOME_DATE = datetime.date(2026, 1, 1)
 
 UAT_OFFICES = [{"id": "68da6b8b-1e07-4742-9333-a882e284c3fb", "officeName": "Serbia (Live Casino)"}]
+
+PS = "app.services.posting_service"
+BENIVO_POST = "app.clients.benivo_client.requests.post"
+BENIVO_GET = "app.clients.benivo_client.requests.get"
 
 
 def _eligible_candidate(**overrides):
@@ -31,8 +35,8 @@ def _eligible_candidate(**overrides):
 # ---------------------------------------------------------------------------
 
 def test_validate_uat_candidate_all_conditions_pass():
-    with patch("posting.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
-         patch("posting.get_terminal_post_log_application_eids", return_value=set()):
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is True
@@ -60,7 +64,7 @@ def test_post_log_preserves_both_business_policy_name_and_api_value():
 
 
 def test_validate_uat_candidate_not_found():
-    with patch("posting.get_candidate_by_application_eid", return_value=None):
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=None):
         result = posting.validate_uat_candidate("MISSING-EID", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -70,8 +74,8 @@ def test_validate_uat_candidate_not_found():
 
 def test_validate_uat_candidate_wrong_workflow_state():
     candidate = _eligible_candidate(workflow_state="Hired")
-    with patch("posting.get_candidate_by_application_eid", return_value=candidate), \
-         patch("posting.get_terminal_post_log_application_eids", return_value=set()):
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -80,8 +84,8 @@ def test_validate_uat_candidate_wrong_workflow_state():
 
 def test_validate_uat_candidate_relocation_not_yes():
     candidate = _eligible_candidate(is_relocation_required="No")
-    with patch("posting.get_candidate_by_application_eid", return_value=candidate), \
-         patch("posting.get_terminal_post_log_application_eids", return_value=set()):
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -90,8 +94,8 @@ def test_validate_uat_candidate_relocation_not_yes():
 
 def test_validate_uat_candidate_missing_start_date():
     candidate = _eligible_candidate(start_date=None)
-    with patch("posting.get_candidate_by_application_eid", return_value=candidate), \
-         patch("posting.get_terminal_post_log_application_eids", return_value=set()):
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -100,8 +104,8 @@ def test_validate_uat_candidate_missing_start_date():
 
 def test_validate_uat_candidate_not_ready_to_post_status():
     candidate = _eligible_candidate(benivo_status="PENDING_MISSING_START_DATE")
-    with patch("posting.get_candidate_by_application_eid", return_value=candidate), \
-         patch("posting.get_terminal_post_log_application_eids", return_value=set()):
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -109,8 +113,8 @@ def test_validate_uat_candidate_not_ready_to_post_status():
 
 
 def test_validate_uat_candidate_already_has_terminal_post_log_result():
-    with patch("posting.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
-         patch("posting.get_terminal_post_log_application_eids", return_value={"APP-UAT-1"}):
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value={"APP-UAT-1"}):
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -119,8 +123,8 @@ def test_validate_uat_candidate_already_has_terminal_post_log_result():
 
 def test_validate_uat_candidate_office_unresolved():
     candidate = _eligible_candidate(workplace="Some Unmapped Site")
-    with patch("posting.get_candidate_by_application_eid", return_value=candidate), \
-         patch("posting.get_terminal_post_log_application_eids", return_value=set()):
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -128,8 +132,8 @@ def test_validate_uat_candidate_office_unresolved():
 
 
 def test_validate_uat_candidate_no_refdata_means_office_unresolved():
-    with patch("posting.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
-         patch("posting.get_terminal_post_log_application_eids", return_value=set()):
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.validate_uat_candidate("APP-UAT-1", refdata=None)
 
     assert result["eligible"] is False
@@ -138,8 +142,8 @@ def test_validate_uat_candidate_no_refdata_means_office_unresolved():
 
 def test_validate_uat_candidate_vip_fails_policy_check():
     candidate = _eligible_candidate(is_vip=True)
-    with patch("posting.get_candidate_by_application_eid", return_value=candidate), \
-         patch("posting.get_terminal_post_log_application_eids", return_value=set()):
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -169,7 +173,7 @@ def test_validate_payload_requires_all_fields():
 def test_select_postable_candidates_uses_normal_path_when_uat_eid_unset(monkeypatch):
     monkeypatch.delenv("BENIVO_UAT_APPLICATION_EID", raising=False)
 
-    with patch("posting.get_ready_candidates", return_value=[]) as mock_ready:
+    with patch(f"{PS}.get_ready_candidates", return_value=[]) as mock_ready:
         posting.select_postable_candidates()
 
     mock_ready.assert_called_once()
@@ -183,11 +187,11 @@ def test_select_postable_candidates_never_calls_normal_path_when_uat_eid_set(mon
     refdata_response = MagicMock(status_code=200)
     refdata_response.json.return_value = {"hasError": False, "data": {"offices": UAT_OFFICES}}
 
-    with patch("posting.get_ready_candidates") as mock_ready, \
-         patch("posting.requests.post", return_value=token_response), \
-         patch("posting.requests.get", return_value=refdata_response), \
-         patch("posting.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
-         patch("posting.get_terminal_post_log_application_eids", return_value=set()):
+    with patch(f"{PS}.get_ready_candidates") as mock_ready, \
+         patch(BENIVO_POST, return_value=token_response), \
+         patch(BENIVO_GET, return_value=refdata_response), \
+         patch(f"{PS}.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.select_postable_candidates(limit=1)
 
     mock_ready.assert_not_called()
@@ -205,11 +209,11 @@ def test_select_postable_candidates_returns_empty_and_never_falls_back_on_failed
 
     ineligible_candidate = _eligible_candidate(benivo_status="PENDING_MISSING_START_DATE")
 
-    with patch("posting.get_ready_candidates") as mock_ready, \
-         patch("posting.requests.post", return_value=token_response) as mock_post, \
-         patch("posting.requests.get", return_value=refdata_response), \
-         patch("posting.get_candidate_by_application_eid", return_value=ineligible_candidate), \
-         patch("posting.get_terminal_post_log_application_eids", return_value=set()):
+    with patch(f"{PS}.get_ready_candidates") as mock_ready, \
+         patch(BENIVO_POST, return_value=token_response), \
+         patch(BENIVO_GET, return_value=refdata_response), \
+         patch(f"{PS}.get_candidate_by_application_eid", return_value=ineligible_candidate), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.select_postable_candidates(limit=1)
 
     assert result == []

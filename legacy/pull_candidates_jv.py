@@ -1,4 +1,10 @@
-"""Jobvite -> benivo.candidates synchronization (extraction, filtering, mapping, load)."""
+"""LEGACY, UNUSED by the active pipeline -- see app/services/synchronization_service.py.
+
+Jobvite -> benivo.candidates synchronization (extraction, filtering, mapping,
+load) via the Jobvite REST API directly. Superseded because the confirmed
+source of truth is jv_arrise_data_schema.jobvite_applications in Postgres,
+not the Jobvite API. Kept, not deleted, per explicit instruction.
+"""
 
 import json
 import os
@@ -8,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from dotenv import load_dotenv
 
-import postgres
+import legacy_candidate_upsert as postgres
 
 load_dotenv()
 

@@ -2,15 +2,14 @@ import datetime
 
 import pytest
 
-from classify_candidates import (
+from app.models.domain import (
     NEEDS_RECRUITER_REVIEW,
     PENDING_MISSING_START_DATE,
     PENDING_OFFICE_MAPPING,
     POSTED,
     READY_TO_POST,
-    classify,
-    is_terminal,
 )
+from app.services.classification_service import classify, is_terminal
 
 SOME_DATE = datetime.date(2026, 1, 1)
 MAPPED_WORKPLACE = "Serbia Live Casino"
@@ -55,7 +54,7 @@ def test_only_posted_is_terminal(non_terminal_status):
 def test_pending_office_mapping_is_not_terminal_so_new_mappings_are_picked_up():
     # Confirms a candidate stuck at PENDING_OFFICE_MAPPING will be freely
     # reclassified (and can become READY_TO_POST) the moment its workplace
-    # is added to posting.WORKPLACE_TO_OFFICE_NAME -- no special-casing
-    # needed beyond PENDING_OFFICE_MAPPING not being terminal.
+    # is added to office_resolution_service.WORKPLACE_TO_OFFICE_NAME -- no
+    # special-casing needed beyond PENDING_OFFICE_MAPPING not being terminal.
     assert is_terminal(PENDING_OFFICE_MAPPING) is False
     assert classify("Yes", SOME_DATE, UNMAPPED_WORKPLACE) == PENDING_OFFICE_MAPPING

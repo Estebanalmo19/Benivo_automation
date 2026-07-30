@@ -4,21 +4,19 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from openpyxl import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-import postgres
-import posting
+from app import config
+from app.clients import benivo_client
+from app.repositories import candidate_repository, post_log_repository
+from app.services import posting_service
+from app.services.office_resolution_service import resolve_office
+from app.services.policy_service import resolve_policy
 
 logger = logging.getLogger(__name__)
-
-if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
 
 REPORT_FILENAME_PREFIX = "benivo_operational_report"
 
@@ -54,8 +52,8 @@ DRY_RUN_NOTE = "No real posting was performed (DRY RUN)."
 
 
 def _report_dir() -> Path:
-    configured = os.getenv("REPORT_FOLDER")
-    report_dir = Path(configured) if configured else Path(__file__).resolve().parent
+    configured = config.report_folder()
+    report_dir = Path(configured) if configured else Path(__file__).resolve().parent.parent.parent
     report_dir.mkdir(parents=True, exist_ok=True)
     return report_dir
 
@@ -106,7 +104,7 @@ def _build_row(
         "location": candidate.get("location"),
         "benivo_status": candidate.get("benivo_status"),
         "is_vip": candidate.get("is_vip"),
-        "policy_name": posting.resolve_policy(candidate.get("is_vip")),
+        "policy_name": resolve_policy(candidate.get("is_vip")),
         "reason": reason,
         "selected_for_current_run": "Yes" if selected else "No",
     }
@@ -139,19 +137,22 @@ def _write_summary_sheet(ws: Worksheet, summary: Dict[str, Any]) -> None:
 
 
 def _fetch_refdata_if_allowed() -> Optional[Dict[str, Any]]:
-    if not posting.allow_reference_data_calls():
+    if not posting_service.allow_reference_data_calls():
         return None
 
     try:
-        token = posting.get_access_token()
-        return posting.get_refdata(token)
+        token = benivo_client.get_access_token()
+        return benivo_client.get_refdata(token)
     except Exception:
-        logger.exception("BENIVO_ALLOW_REFERENCE_DATA_CALLS is set but fetching refdata failed; office resolution will be treated as unresolved for this report.")
+        logger.exception(
+            "BENIVO_ALLOW_REFERENCE_DATA_CALLS is set but fetching refdata failed; "
+            "office resolution will be treated as unresolved for this report."
+        )
         return None
 
 
 def _posting_result_row(candidate: Dict[str, Any], result: Dict[str, Any], selected: bool) -> Dict[str, Any]:
-    status = posting._post_log_status_from_outcome(result["outcome"])
+    status = posting_service._post_log_status_from_outcome(result["outcome"])
 
     reasons = {
         "SUCCESS": "Candidate successfully created in Benivo.",
@@ -183,8 +184,8 @@ def generate_reports(
     select_postable_candidates()/post_candidates() so selected_for_current_run
     and the posting-outcome counts reflect the actual current execution.
     """
-    all_candidates = postgres.get_all_candidates_for_report()
-    terminal_eids = postgres.get_terminal_post_log_application_eids()
+    all_candidates = candidate_repository.get_all_candidates_for_report()
+    terminal_eids = post_log_repository.get_terminal_post_log_application_eids()
     selected_eids = {c.get("application_eid") for c in selected_candidates}
 
     mobility_candidates = [c for c in all_candidates if c.get("workflow_state") == MOBILITY_WORKFLOW_STATE]
@@ -200,8 +201,8 @@ def generate_reports(
     relocation_yes_with_start_date = [c for c in relocation_yes if c.get("start_date")]
 
     # Sheet placement reads the already-persisted benivo_status directly.
-    # classify_candidates() is the single place that decides READY_TO_POST vs
-    # PENDING_OFFICE_MAPPING (via the same static WORKPLACE_TO_OFFICE_NAME
+    # classification_service is the single place that decides READY_TO_POST
+    # vs PENDING_OFFICE_MAPPING (via the same static WORKPLACE_TO_OFFICE_NAME
     # mapping) -- this report displays that decision, it does not re-derive it.
     ready_to_post_population = [c for c in mobility_candidates if c.get("benivo_status") == "READY_TO_POST"]
     pending_office_mapping_population = [c for c in mobility_candidates if c.get("benivo_status") == "PENDING_OFFICE_MAPPING"]
@@ -211,7 +212,7 @@ def generate_reports(
 
     # officeName/officeId here are display enrichment only (live refdata
     # lookup), not a readiness decision -- readiness was already decided by
-    # classify_candidates() and is reflected in ready_to_post_population.
+    # classification_service and is reflected in ready_to_post_population.
     ready_to_post_rows: List[Dict[str, Any]] = []
     terminal_in_ready_population = 0
 
@@ -223,7 +224,7 @@ def generate_reports(
             continue
 
         selected = application_eid in selected_eids
-        office = posting._resolve_office(candidate, refdata) if refdata is not None else None
+        office = resolve_office(candidate, refdata) if refdata is not None else None
         ready_to_post_rows.append(_build_row(candidate, READY_REASON, office=office, selected=selected))
 
     missing_office_rows = [

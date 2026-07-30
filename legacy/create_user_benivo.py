@@ -1,3 +1,12 @@
+"""LEGACY, UNUSED by the active pipeline -- see app/services/posting_service.py.
+
+Standalone single-candidate Benivo API connectivity test script (hardcoded
+test user, not fed by real candidate data). Superseded by
+posting_service.post_single_candidate(), which generalizes this same
+token/refdata/create/verify flow to real candidates. Kept, not deleted, per
+explicit instruction.
+"""
+
 import json
 import os
 import sys

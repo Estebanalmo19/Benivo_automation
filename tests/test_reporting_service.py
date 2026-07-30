@@ -1,9 +1,8 @@
 import datetime
-from unittest.mock import patch
 
 from openpyxl import load_workbook
 
-import reporting
+from app.services import reporting_service as reporting
 
 SOME_DATE = datetime.date(2026, 1, 1)
 
@@ -89,11 +88,11 @@ def test_build_row_policy_name_from_is_vip():
 
 
 # ---------------------------------------------------------------------------
-# generate_reports() end-to-end (mocked DB + no reference-data calls)
+# generate_reports() end-to-end (mocked repositories + no reference-data calls)
 # ---------------------------------------------------------------------------
 
 def _mock_population():
-    # benivo_status here reflects what classify_candidates() would already
+    # benivo_status here reflects what classification_service would already
     # have persisted (READY_TO_POST vs PENDING_OFFICE_MAPPING) -- reporting
     # trusts this status directly rather than re-deriving it.
     return [
@@ -107,9 +106,9 @@ def _mock_population():
 
 def test_generate_reports_reconciles_with_summary(tmp_path, monkeypatch):
     monkeypatch.setattr(reporting, "_report_dir", lambda: tmp_path)
-    monkeypatch.setattr(postgres_module := reporting.postgres, "get_all_candidates_for_report", lambda: _mock_population())
-    monkeypatch.setattr(postgres_module, "get_terminal_post_log_application_eids", lambda: set())
-    monkeypatch.setattr(reporting.posting, "allow_reference_data_calls", lambda: False)
+    monkeypatch.setattr(reporting.candidate_repository, "get_all_candidates_for_report", lambda: _mock_population())
+    monkeypatch.setattr(reporting.post_log_repository, "get_terminal_post_log_application_eids", lambda: set())
+    monkeypatch.setattr(reporting.posting_service, "allow_reference_data_calls", lambda: False)
 
     selected = [_mock_population()[0]]  # READY-1 selected
 
@@ -177,9 +176,9 @@ def test_generate_reports_reconciles_with_summary(tmp_path, monkeypatch):
 
 def test_generate_reports_selected_count_never_exceeds_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(reporting, "_report_dir", lambda: tmp_path)
-    monkeypatch.setattr(reporting.postgres, "get_all_candidates_for_report", lambda: _mock_population())
-    monkeypatch.setattr(reporting.postgres, "get_terminal_post_log_application_eids", lambda: set())
-    monkeypatch.setattr(reporting.posting, "allow_reference_data_calls", lambda: False)
+    monkeypatch.setattr(reporting.candidate_repository, "get_all_candidates_for_report", lambda: _mock_population())
+    monkeypatch.setattr(reporting.post_log_repository, "get_terminal_post_log_application_eids", lambda: set())
+    monkeypatch.setattr(reporting.posting_service, "allow_reference_data_calls", lambda: False)
 
     selected = _mock_population()[:2]
 

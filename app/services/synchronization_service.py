@@ -1,7 +1,7 @@
 """Structural synchronization of benivo.candidates from jv_arrise_data_schema.jobvite_applications.
 
 Pure data synchronization only: no business classification, no posting
-decisions. See classify_candidates.py for business rules.
+decisions. See classification_service.py for business rules.
 """
 
 import logging
@@ -10,15 +10,9 @@ from typing import Any, Dict
 
 import psycopg2
 
-from postgres import transaction
+from app.clients.database_client import transaction
 
 logger = logging.getLogger(__name__)
-
-if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
 
 WORKFLOW_STATE = "Mobility in process"
 RELOCATION_FIELD_CODE = "is_relocation_required"
@@ -30,7 +24,7 @@ DEFAULT_BENIVO_STATUS = "PENDING"
 # from both the INSERT column list's dependency on source data and DO
 # UPDATE SET, so a sync never overwrites them. benivo_status is only set to
 # DEFAULT_BENIVO_STATUS on first insert; classification happens later, in
-# classify_candidates().
+# classification_service.
 #
 # is_vip specifically: there is currently no confirmed Jobvite source field
 # for VIP (application/job customFields were inspected for this same reason
@@ -43,7 +37,7 @@ DEFAULT_BENIVO_STATUS = "PENDING"
 # add it to the DO UPDATE SET list so it becomes source-refreshed like them.
 #
 # start_date and workplace ARE source-owned and must be refreshed every
-# sync (per confirmed evidence, see delivery notes):
+# sync (per confirmed evidence, see git history):
 #   start_date <- application.startDate (epoch-ms string), formula verified
 #     against 5 rows where both source and legacy target values existed:
 #     to_timestamp(ms::bigint / 1000)::date matched exactly in all 5.
@@ -52,8 +46,7 @@ DEFAULT_BENIVO_STATUS = "PENDING"
 # host_country, host_city, population, vip have NO confirmed source field
 # anywhere in jv_arrise_data_schema.jobvite_applications (application
 # customFields, job customFields, and top-level candidate/application keys
-# were all inspected) and are deliberately NOT included here -- see
-# delivery notes for what was checked and ruled out.
+# were all inspected) and are deliberately NOT included here.
 _UPSERT_SQL = """
 INSERT INTO benivo.candidates (
     application_eid,
@@ -195,7 +188,3 @@ def sync_candidates() -> Dict[str, Any]:
         "removed": removed,
         "duration_seconds": round(duration_seconds, 2),
     }
-
-
-if __name__ == "__main__":
-    print(sync_candidates())

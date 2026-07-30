@@ -1,61 +1,15 @@
 {
     "candidates": [
         {
-            "address": "5.05 Rosemary Court Sir William Jackson Grove",
+            "address": "",
             "address2": "",
             "application": {
-                "comments": "",
                 "consentStatus": "Not Requested",
                 "customField": [
                     {
-                        "fieldCode": "reporting_manager",
-                        "key": "Reporting manager",
-                        "value": "Ted Sacarello"
-                    },
-                    {
-                        "fieldCode": "benefits",
-                        "key": "Benefits",
-                        "value": "Private health insurance, free gym membership (Ocean Village or Atlantic Suites), free lunch delivered daily to office."
-                    },
-                    {
-                        "fieldCode": "salary",
-                        "key": "Salary",
-                        "value": "38000.00"
-                    },
-                    {
-                        "fieldCode": "salary_frequency",
-                        "key": "Salary frequency",
-                        "value": "per annum"
-                    },
-                    {
-                        "fieldCode": "gross_or_net",
-                        "key": "Gross or net",
-                        "value": "Gross"
-                    },
-                    {
-                        "fieldCode": "holiday_days",
-                        "key": "Holiday (days)",
-                        "value": "23"
-                    },
-                    {
-                        "fieldCode": "offer_currency",
-                        "key": "Offer currency",
-                        "value": "GBP"
-                    },
-                    {
-                        "fieldCode": "desired_salary",
-                        "key": "Desired salary",
-                        "value": "40,000.00"
-                    },
-                    {
-                        "fieldCode": "desired_salary_currency",
-                        "key": "Desired salary currency",
-                        "value": "GBP"
-                    },
-                    {
-                        "fieldCode": "working_hours",
-                        "key": "Working hours",
-                        "value": "40 hours per week."
+                        "fieldCode": "recruiter",
+                        "key": "Recruiter",
+                        "value": "stefania.aird@arrise.com"
                     },
                     {
                         "fieldCode": "by_clicking_the_i_accept_button_you_expressly_make_the_following_representations_and_warranties_and_give_your_consents_as_described_in_the_help_text_question_mark",
@@ -63,124 +17,62 @@
                         "value": "I accept"
                     },
                     {
-                        "fieldCode": "approved_by",
-                        "key": "Approved by",
-                        "value": "Paul Dever"
-                    },
-                    {
-                        "fieldCode": "current_employer",
-                        "key": "Current employer",
-                        "value": "Moneycorp Bank Gibraltar"
-                    },
-                    {
-                        "fieldCode": "reporting_manager_job_title",
-                        "key": "Reporting manager job title",
-                        "value": "Treasury Manager"
+                        "fieldCode": "sourcer",
+                        "key": "Sourcer",
+                        "value": "stefania.aird@arrise.com"
                     },
                     {
                         "fieldCode": "is_relocation_required",
                         "key": "Is relocation required?",
-                        "value": "No"
+                        "value": "Yes"
                     },
                     {
-                        "fieldCode": "ctc_per_annum_euros",
-                        "key": "CTC per annum (Euros)",
-                        "value": "46878.00"
+                        "fieldCode": "externalreferral_name",
+                        "key": "External referrer name",
+                        "value": "Name"
                     },
                     {
-                        "fieldCode": "gross_per_annum_eur",
-                        "key": "Gross per annum (EUR)",
-                        "value": "43533.00"
+                        "fieldCode": "externalreferral_email",
+                        "key": "External referrer email",
+                        "value": "stefania.aird@arrise.com"
                     },
                     {
-                        "fieldCode": "bonus_write_as_a_sentence",
-                        "key": "Bonus (write as a sentence)",
-                        "value": "The employee will be eligible to receive a bonus, at the Company’s sole discretion, of up to 10% of their annual salary (the “Bonus”), payable on an annual basis. The Bonus percentage outlined above is calculated based on the KPI’s."
+                        "fieldCode": "externalreferral_bugarian_resident_confirmation",
+                        "key": "External referral - please confirm that you are a Bulgarian resident",
+                        "value": "Yes"
                     },
                     {
-                        "fieldCode": "notice_period_during_probation_write_as_a_sentence",
-                        "key": "Notice period during probation (write as a sentence)",
-                        "value": "1 month"
+                        "fieldCode": "externalreferral_last_name",
+                        "key": "External referral last name",
+                        "value": "Last name"
                     },
                     {
-                        "fieldCode": "list_of_main_responsibilities",
-                        "key": "List of main responsibilities",
-                        "value": "-Maintain relationships with current and future banks and crypto wallets.\n-Help manage the onboarding process for banks and crypto wallets across the Group.\n-Work with the team towards expanding and enhancing the Group’s banking and crypto capabilities in different jurisdictions.\n-Be involved in the direct relationship with banks in relation to ad hoc transaction related queries and the provision of requested back up documentation.\n-Help keeping all KYC documentation up to date with the banks.\n-Perform miscellaneous duties as assigned.\n-Ensure and keep a good reputation for the Company and the Group.\n-Any other services which may be reasonably required by the Company and the Group from time to time, which fall under the Employee’s area of expertise."
-                    },
-                    {
-                        "fieldCode": "notice",
-                        "key": "Notice",
-                        "value": "1 month"
-                    },
-                    {
-                        "fieldCode": "probation_period",
-                        "key": "Probation period",
-                        "value": "6 months"
-                    },
-                    {
-                        "fieldCode": "if_remote_location_candidate_will_work_from_na_if_not_remote",
-                        "key": "If remote, location candidate will work from (\"n/a\" if not remote)",
-                        "value": "N/A"
-                    },
-                    {
-                        "fieldCode": "salary__annual_gross_local_currency",
-                        "key": "Salary - annual gross (local currency)",
-                        "value": "38000.00"
-                    },
-                    {
-                        "fieldCode": "candidate_home_country",
-                        "key": "Candidate home country",
-                        "value": "Gibraltar"
-                    },
-                    {
-                        "fieldCode": "reason_for_joining",
-                        "key": "Reason for joining",
-                        "value": "Career Growth"
-                    },
-                    {
-                        "fieldCode": "mobility_support",
-                        "key": "Please select requirements for support",
-                        "value": "N/A"
-                    },
-                    {
-                        "fieldCode": "are_you_an_employee_of_arrise",
-                        "key": "Are you an employee of ARRISE?",
-                        "value": "No"
-                    },
-                    {
-                        "fieldCode": "please_select_your_english_level",
-                        "key": "Please select your English Level.",
-                        "value": "Advanced"
-                    },
-                    {
-                        "fieldCode": "hibob_id",
-                        "key": "HiBob ID",
-                        "value": "53241"
+                        "fieldCode": "externalreferral_candidateconsent",
+                        "key": "externalreferral_candidateconsent",
+                        "value": "I confirm"
                     }
                 ],
-                "disposition": "Hired",
-                "eId": "piuqtywI",
+                "eId": "pu4Kdxwx",
                 "gender": "Undefined",
                 "hasArtifacts": true,
-                "hireDate": 1775631600000,
                 "job": {
-                    "categoryName": "Finance",
+                    "categoryName": "Game presenters and shufflers",
                     "company": "ARRISE",
                     "customField": [
                         {
+                            "fieldCode": "video_screen",
+                            "key": "Video Screen",
+                            "value": "64c10c1f41518126a32a7a03"
+                        },
+                        {
                             "fieldCode": "internal_job_title",
                             "key": "Internal job title",
-                            "value": "Treasury Analyst"
+                            "value": "TEST - presenter / shuffler - video first"
                         },
                         {
-                            "fieldCode": "salary_from",
-                            "key": "Salary from",
-                            "value": "35000"
-                        },
-                        {
-                            "fieldCode": "reason",
-                            "key": "Reason",
-                            "value": "New"
+                            "fieldCode": "exclude_from_tth",
+                            "key": "Exclude from tth",
+                            "value": "Yes"
                         },
                         {
                             "fieldCode": "contract_type",
@@ -188,9 +80,14 @@
                             "value": "Full time"
                         },
                         {
+                            "fieldCode": "evergreen",
+                            "key": "Evergreen",
+                            "value": "Yes"
+                        },
+                        {
                             "fieldCode": "requisition_currency",
                             "key": "Requisition currency",
-                            "value": "GBP"
+                            "value": "BRL"
                         },
                         {
                             "fieldCode": "working_type",
@@ -198,34 +95,39 @@
                             "value": "On site"
                         },
                         {
-                            "fieldCode": "salary_frequency",
-                            "key": "Salary frequency",
-                            "value": "Per annum"
-                        },
-                        {
                             "fieldCode": "gross_or_net",
                             "key": "Gross or net",
                             "value": "Gross"
                         },
                         {
-                            "fieldCode": "salary_up_to",
-                            "key": "Salary up to",
-                            "value": "40000"
+                            "fieldCode": "language",
+                            "key": "Language",
+                            "value": "Turkish"
+                        },
+                        {
+                            "fieldCode": "dealer__shuffler",
+                            "key": "Dealer / shuffler",
+                            "value": "Presenter"
+                        },
+                        {
+                            "fieldCode": "exclude_from_live_and_ytd",
+                            "key": "Exclude from live and ytd",
+                            "value": "Yes"
+                        },
+                        {
+                            "fieldCode": "table_language",
+                            "key": "Table language",
+                            "value": "English"
                         },
                         {
                             "fieldCode": "business_unit",
                             "key": "Business unit",
-                            "value": "Finance"
-                        },
-                        {
-                            "fieldCode": "coordinator",
-                            "key": "Coordinator",
-                            "value": "reetta.laukkanen@arrise.com"
+                            "value": "Operations"
                         },
                         {
                             "fieldCode": "sub_department",
                             "key": "Sub department",
-                            "value": "Treasury"
+                            "value": "Global TA"
                         },
                         {
                             "fieldCode": "entity",
@@ -233,138 +135,137 @@
                             "value": "Arrise Ltd"
                         },
                         {
-                            "fieldCode": "senior_leader",
-                            "key": "Senior leader",
-                            "value": "paul.dever@arrise.com"
-                        },
-                        {
-                            "fieldCode": "senior_leader_2",
-                            "key": "Senior leader 2",
-                            "value": "paul.dever@arrise.com"
-                        },
-                        {
                             "fieldCode": "gross_annual_salary_local_currency",
                             "key": "Gross annual salary (local currency)",
-                            "value": "40000"
-                        },
-                        {
-                            "fieldCode": "bonus_percent",
-                            "key": "Bonus percent",
                             "value": "10"
                         },
                         {
                             "fieldCode": "site",
                             "key": "Site",
-                            "value": "Gibraltar ARRISE"
+                            "value": "Brazil Live Casino"
                         },
                         {
                             "fieldCode": "employment_type",
                             "key": "Employment type",
-                            "value": "Permanent"
+                            "value": "Live Casino Floor Personnel"
                         },
                         {
                             "fieldCode": "salary_pay_type",
                             "key": "Salary pay type",
-                            "value": "Salaried"
+                            "value": "Hourly"
                         },
                         {
                             "fieldCode": "country_for_hibob",
                             "key": "Country (for HiBob)",
-                            "value": "Gibraltar"
+                            "value": "Brazil"
                         },
                         {
                             "fieldCode": "apply_workflow",
                             "key": "Apply workflow",
-                            "value": "Support - ARRISE"
+                            "value": "Presenter / shuffler - no CV"
+                        },
+                        {
+                            "fieldCode": "approvals_in_notes",
+                            "key": "Approvals in notes",
+                            "value": "Yes"
                         },
                         {
                             "fieldCode": "role_year",
                             "key": "Role year",
-                            "value": "2026"
+                            "value": "Test req"
                         },
                         {
-                            "fieldCode": "working_type_detail",
-                            "key": "Working type detail",
-                            "value": "5 days"
+                            "fieldCode": "post_to_job_boards",
+                            "key": "Post to additional job boards",
+                            "value": "HH.kz"
+                        },
+                        {
+                            "fieldCode": "seo_keywords",
+                            "key": "Search keywords",
+                            "value": "Game presenter"
+                        },
+                        {
+                            "fieldCode": "willo_key",
+                            "key": "Willo invitation link",
+                            "value": "https://app.willotalent.com/invite/n17SSL/"
                         }
                     ],
-                    "department": "Finance",
-                    "eId": "oadGzfwm",
+                    "department": "HR",
+                    "eId": "oSXVvfwZ",
                     "hiringManagers": [
                         {
-                            "firstName": "Ian",
-                            "lastName": "Appleton",
-                            "userId": "s4VWjlw4",
-                            "userName": "ian.appleton@arrise.com"
+                            "firstName": "Stef",
+                            "lastName": "Aird",
+                            "userId": "sex7YlwG",
+                            "userName": "stefania.aird@arrise.com"
                         }
                     ],
                     "jobType": "Permanent",
-                    "location": "Gibraltar, Gibraltar",
+                    "location": "Brazil, Sao Paulo",
                     "postingType": "Limited Access",
                     "primaryHiringManager": {
-                        "firstName": "Ian",
-                        "lastName": "Appleton",
-                        "userId": "s4VWjlw4",
-                        "userName": "ian.appleton@arrise.com"
+                        "firstName": "Stef",
+                        "lastName": "Aird",
+                        "userId": "sex7YlwG",
+                        "userName": "stefania.aird@arrise.com"
                     },
                     "primaryRecruiter": {
-                        "firstName": "Anna",
-                        "lastName": "Beginska",
-                        "userId": "svtjWmw4",
-                        "userName": "anna.beginska@arrise.com"
+                        "firstName": "Stef",
+                        "lastName": "Aird",
+                        "userId": "sex7YlwG",
+                        "userName": "stefania.aird@arrise.com"
                     },
                     "recruiters": [
                         {
-                            "firstName": "Reetta",
-                            "lastName": "Laukkanen",
-                            "userId": "smg7tlw2",
-                            "userName": "reetta.laukkanen@arrise.com"
+                            "firstName": "Stef",
+                            "lastName": "Aird",
+                            "userId": "sex7YlwG",
+                            "userName": "stefania.aird@arrise.com"
                         },
                         {
-                            "firstName": "Anna",
-                            "lastName": "Beginska",
-                            "userId": "svtjWmw4",
-                            "userName": "anna.beginska@arrise.com"
+                            "firstName": "Esteban",
+                            "lastName": "Alvarez Moreno",
+                            "userId": "sc0N5mwV",
+                            "userName": "esteban.alvarez@arrise.com"
                         }
                     ],
-                    "requisitionId": "6120",
+                    "requisitionId": "3696",
                     "subsidiaryId": "fXkbVfw7",
                     "subsidiaryName": "ARRISE",
-                    "title": "Treasury Analyst"
+                    "title": "TEST - presenter / shuffler - video first"
                 },
                 "jobviteChannel": "None",
-                "lastUpdatedDate": 1779196472877,
+                "lastUpdatedDate": 1782308454813,
                 "personalDataProcessingStatus": "active",
                 "race": "Undefined",
                 "resume": {
-                    "content": "\n                              Chloe Connie Jane Traverso\n\n     Tel: (+350) 56020155| Chloe.traverso16@gmail.com linkedin.com/in/chloe -\n                                      traverso-b65970270\n\n Address: 2.5.05 Rosemary Court Sir William Jackson Grove Gibraltar GX11 1AA\n                      \n Gender: Female\n\n I am a motivated BSc Psychology graduate currently working in the corporate\n banking sector. I thrive in collaborative environments and excel in independent work.\n Consistent, reliable, and passionate about my role, I am eager to expand my skill\n set and embrace new experiences.\n\n Work Experience:\n\n Moneycorp Bank Gibraltar - client services representative\n July 29th, 2024 - present\n\n In my role at Moneycorp Bank, I provide direct support to corporate and private\n clients, with a focus on KYC, account management, and payment operations. I work\n closely with compliance and relationship management teams, ensuring regulatory\n adherence while delivering high standards of client service. My responsibilities\n extend beyond payment issues, allowing me to broaden my skills within the\n corporate banking sector and enhance my ability to manage client relationships.\n\n Key responsibilities & achievements:\n Payment processing:\n     * Conduct proactive client outreach for held payments to ensure smooth and\n         fast processing and allocation.\n     * Create beneficiaries and payments.\n     * Authenticate SWIFT messaging with various banking institutions for payment\n         investigations (Tracers, Recalls, RFIs, etc.).\n\n Client & Account management:\n\n     *   Create and update named individuals on corporate accounts and manage\n         account closures, ensuring accuracy and regulatory compliance.\n     *   Proactively handle client queries across phone and email, resolving access,\n         user, and documentation issues effectively.\n     *   Manage end-to-end KYC refresh for corporate and private client accounts,\n         aligning with AML, CDD and internal policy standards.\n     *   Work closely with Senior Relationship managers on complex corporate\n         structures and assist in the onboarding and retention of these high value\n         clients.\n     *   Partner with relationship managers during account openings, including\n         attending client meetings and coordinating all required onboarding\n         documents.\n     *   Assist Relationship Managers achieve personal targets i.e. income\n         generation.\n     * Implementation and enhancement of processes for efficiency.\n     * Taken leadership role when working towards tight deadlines to reach optimal\n         results for all stakeholders.\n     *   Consistently receive positive feedback from my seniors, peers and clients\n         alike.\n     * Mentor and aid in training new recruits.\n Compliance Support:\n     * Acquire supporting documents (SOF/SOW, CDD, KYC, supporting payment\n         docs, sanction screening hits, etc.).\n     *   Work closely with the compliance team to conduct remediation exercises with\n         clients, ensuring proactive follow-up and management of account status both\n         internally and with the client.\n     * Adhere to consumer duty policies.\n Complaints Management and Handling:\n     * Adhere strictly to internal procedures and policies.\n\n Sports Direct Leeds - Casual assistant (part-time)\n December 2021- May 2024 (Seasonal)\n\n     *   Delivered strong customer service in high-volume retail environments.\n     *   Supported operations through stock control, team coordination via radio, and\n         till management.\n     *   Developed confidence in decision-making, successfully working on individual\n         tasks within a dynamic team environment.\n\n (References can be obtained upon request)\n\n Mark's & Spencer Gibraltar- Customer Assistant (Part-time)\n\n October 2020- September 2023 (Seasonal)\n\n     *   Maintained high standards of shop floor presentation and customer care.\n     *   Demonstrated multitasking, reliability, and problem-solving under pressure.\n     *   Built positive relationships with colleagues and customers, contributing to a\n         cooperative and supportive work environment.\n\n (References can be obtained upon request)\n\n Education:\n Undergraduate Degree: BSc (Hons) Psychology upper-division second-class\n honours\n\n A-Levels:\n Psychology A\n Business Studies A\n English Literature C\n\n GCSE's:\n Spanish 4\n Mathematics 5\n English Language (London Board) A*\n English Language 7\n English Literature 7\n Dual Science 5 5\n History 5\n Business Studies 4\n\n Key Skills:\n Payment processing\n Client relationship support\n Problem-solving & effective communication\n Critical thinking\n Time management\n Willingness to learn\n Attention to detail\n Adaptability in fast-paced environments\n\n Technical:\n Proficient in MS Office & financial systems\n SPSS\n",
+                    "content": "\nStef Test\n\nAddress: CA\nMobile Phone: 1231231233\nEmail: stefania.aird@gmail.com\n\n",
                     "format": "Text",
-                    "name": "2500710386.pdf"
+                    "name": "2375162937.doc"
                 },
-                "sentDate": 1773947226055,
-                "source": "Anna Beginska",
-                "sourceType": "Sourcing",
-                "startDate": 1783926000000,
+                "sentDate": 1752595654682,
+                "source": "",
+                "sourceType": "External referral",
                 "veteranStatus": "Undefined",
-                "workflowState": "Hired",
-                "workflowStateEId": "zab1Wfw2"
+                "workflowState": "Mobility in process",
+                "workflowStateEId": "zS3oXfw0"
             },
-            "city": "Gibraltar",
-            "companyName": "Moneycorp Bank Gibraltar",
-            "country": "GIB",
-            "countryCode": "GIB",
-            "countryName": "Gibraltar",
-            "eId": "e8dNotwu",
-            "email": "Chloe.traverso16@gmail.com",
-            "firstName": "Chloe",
+            "city": "town?",
+            "companyName": "",
+            "country": "COL",
+            "countryCode": "COL",
+            "countryName": "Colombia",
+            "eId": "eYpVDrwR",
+            "email": "esteban.alvarez@arrise.com",
+            "firstName": "Елена",
             "homePhone": "",
-            "lastName": "Traverso",
-            "location": "Gibraltar,  Gibraltar",
-            "mobile": "+350 56020155",
-            "postalCode": "GX11 1AA",
+            "lastName": "Хлебинская",
+            "location": "town?, YT Colombia",
+            "mobile": "1231231231",
+            "postalCode": "",
             "smsConsent": true,
-            "state": "",
-            "title": "client services representative",
+            "state": "YT",
+            "title": "",
             "workPhone": "",
             "workStatus": "None"
         }
