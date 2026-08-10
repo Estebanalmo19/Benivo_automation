@@ -36,13 +36,33 @@ DEFAULT_BENIVO_STATUS = "PENDING"
 # SELECT expression here (same pattern as start_date/workplace below) AND
 # add it to the DO UPDATE SET list so it becomes source-refreshed like them.
 #
-# start_date and workplace ARE source-owned and must be refreshed every
-# sync (per confirmed evidence, see git history):
-#   start_date <- application.startDate (epoch-ms string), formula verified
-#     against 5 rows where both source and legacy target values existed:
-#     to_timestamp(ms::bigint / 1000)::date matched exactly in all 5.
-#   workplace  <- application.job.customField['site'], verified against 816
-#     existing target rows: 812 (99.5%) already matched this value exactly.
+# start_date, workplace, and home_country ARE source-owned and must be
+# refreshed every sync (per confirmed evidence, see git history and the
+# 2026-08-06 Jobvite data audit):
+#   start_date    <- application.startDate (epoch-ms string), formula
+#     verified against 5 rows where both source and legacy target values
+#     existed: to_timestamp(ms::bigint / 1000)::date matched exactly in all 5.
+#   workplace     <- application.job.customField['site'], verified against
+#     816 existing target rows: 812 (99.5%) already matched this value
+#     exactly.
+#   home_country  <- application.customField['candidate_home_country']
+#     (label "Candidate home country"). Confirmed as the correct,
+#     purpose-built source (distinct from the candidate's top-level mailing
+#     address country) during the 2026-08-06 audit; previously present in
+#     raw_payload but never wired into this UPSERT -- benivo.candidates
+#     .home_country stayed NULL despite the column already existing.
+#   current_country <- raw_payload.countryName (top-level candidate-profile
+#     field, sibling of firstName/lastName/email -- NOT parsed from the
+#     'location' display string "city, state country", NOT
+#     application.job.location which is the JOB's location). Confirmed
+#     2026-08-10 while investigating why candidates with country data
+#     visible in Jobvite were showing as missing home_country: neither
+#     example candidate has a candidate_home_country customField entry, but
+#     both -- and 100% of the 99 candidates missing home_country as of that
+#     investigation -- have a populated countryName. This is the FALLBACK
+#     source only; app/services/home_country_service.py resolves the
+#     effective value candidates/postings actually use. home_country itself
+#     is never overwritten by this fallback.
 # host_country, host_city, population, vip have NO confirmed source field
 # anywhere in jv_arrise_data_schema.jobvite_applications (application
 # customFields, job customFields, and top-level candidate/application keys
@@ -63,6 +83,8 @@ INSERT INTO benivo.candidates (
     location,
     start_date,
     workplace,
+    home_country,
+    current_country,
     source_payload,
     benivo_status,
     updated_at
@@ -91,6 +113,13 @@ SELECT
         WHERE job_cf->>'fieldCode' = 'site'
         LIMIT 1
     ) AS workplace,
+    (
+        SELECT app_cf->>'value'
+        FROM jsonb_array_elements(j.raw_payload->'application'->'customField') app_cf
+        WHERE app_cf->>'fieldCode' = 'candidate_home_country'
+        LIMIT 1
+    ) AS home_country,
+    NULLIF(j.raw_payload->>'countryName', '') AS current_country,
     j.raw_payload,
     %(default_status)s,
     NOW()
@@ -116,6 +145,8 @@ DO UPDATE SET
     location = EXCLUDED.location,
     start_date = EXCLUDED.start_date,
     workplace = EXCLUDED.workplace,
+    home_country = EXCLUDED.home_country,
+    current_country = EXCLUDED.current_country,
     source_payload = EXCLUDED.source_payload,
     updated_at = NOW();
 """

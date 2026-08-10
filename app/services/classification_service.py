@@ -8,6 +8,7 @@ up automatically on the next run.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import psycopg2
@@ -22,6 +23,7 @@ from app.models.domain import (
     TERMINAL_CANDIDATE_STATUSES,
 )
 from app.services.office_resolution_service import resolve_office_name
+from app.services.start_date_service import resolve_effective_start_date
 
 logger = logging.getLogger(__name__)
 
@@ -30,22 +32,35 @@ def is_terminal(status: Optional[str]) -> bool:
     return status in TERMINAL_CANDIDATE_STATUSES
 
 
-def classify(is_relocation_required: Optional[str], start_date: Any, workplace: Optional[str]) -> str:
+def classify(
+    is_relocation_required: Optional[str],
+    start_date: Any,
+    workplace: Optional[str],
+    execution_timestamp: datetime,
+) -> str:
     """
     Pure business rule, no network I/O (office check is against the static,
     explicit office_resolution_service.WORKPLACE_TO_OFFICE_NAME mapping
     only -- no API call):
-      Yes + start_date present + workplace mapped   -> READY_TO_POST
-      Yes + start_date present + workplace unmapped  -> PENDING_OFFICE_MAPPING
-      Yes + start_date missing                       -> PENDING_MISSING_START_DATE
-      No / null / unrecognized                       -> NEEDS_RECRUITER_REVIEW
+      Yes + effective start date resolved + workplace mapped    -> READY_TO_POST
+      Yes + effective start date resolved + workplace unmapped  -> PENDING_OFFICE_MAPPING
+      Yes + effective start date NOT resolved                   -> PENDING_MISSING_START_DATE
+      No / null / unrecognized                                  -> NEEDS_RECRUITER_REVIEW
+
+    start_date is Jobvite-sourced and may be missing. When it is,
+    resolve_effective_start_date() (temporary business rule, see that
+    module) supplies a calculated fallback instead of blocking readiness --
+    so PENDING_MISSING_START_DATE is now a defensive branch only, reachable
+    only if a future rule change makes resolution genuinely fail.
     """
     value = (is_relocation_required or "").strip().lower()
 
     if value != "yes":
         return NEEDS_RECRUITER_REVIEW
 
-    if not start_date:
+    effective_start_date, _source = resolve_effective_start_date(start_date, execution_timestamp)
+
+    if not effective_start_date:
         return PENDING_MISSING_START_DATE
 
     if resolve_office_name(workplace) is None:
@@ -70,6 +85,12 @@ def classify_candidates() -> Dict[str, int]:
     """Re-derive benivo_status for every non-terminal candidate, in one transaction."""
     logger.info("Candidate classification started.")
 
+    # Generated once for the whole run and reused for every candidate below
+    # -- never call datetime.now() per-candidate, or candidates processed
+    # moments apart could land in different calculated months for no
+    # business reason. See start_date_service.resolve_effective_start_date().
+    execution_timestamp = datetime.now(timezone.utc)
+
     counts = {
         READY_TO_POST: 0,
         PENDING_MISSING_START_DATE: 0,
@@ -84,7 +105,9 @@ def classify_candidates() -> Dict[str, int]:
             rows = _fetch_classifiable_candidates(cur)
 
             for row in rows:
-                new_status = classify(row["is_relocation_required"], row["start_date"], row["workplace"])
+                new_status = classify(
+                    row["is_relocation_required"], row["start_date"], row["workplace"], execution_timestamp
+                )
                 counts[new_status] += 1
 
                 cur.execute(

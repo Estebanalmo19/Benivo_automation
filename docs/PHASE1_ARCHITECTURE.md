@@ -88,6 +88,9 @@ Jobvite → Benivo
 - start_date → startDateOfAssignment
 - VIP custom field → policy
 - workplace / host_country / host_city → officeId
+- home_country → homeCountry (create-user, confirmed 2026-08-10)
+- job_title → hostJobRole (Case PATCH only, confirmed 2026-08-10)
+- home_country → homeLocation.country (Case PATCH only, confirmed 2026-08-10)
 
 Policy rules:
 
@@ -122,6 +125,42 @@ Each execution generates:
 - Success
 - Failed
 - Skipped
+
+---
+
+## Host Country (office-derived) & Case API status
+
+Confirmed 2026-08-06 by official email from Benivo (full office catalogue:
+display name + PublicId):
+
+- `hostCountry` is derived **exclusively** from the resolved Benivo office
+  (`office_resolution_service.OFFICE_NAME_TO_HOST_COUNTRY`, keyed on the
+  confirmed officeName catalogue) -- never inferred from the candidate's own
+  address/location fields.
+- `officeId` (as already sent in the `create-user` payload) is the confirmed
+  Benivo **PublicId**, not a guessed or internal-only identifier.
+
+Confirmed 2026-08-10 by official email from Gina (Benivo) -- Case API
+integration is **implemented**:
+
+- `assignmentId` returned by `create-user` **is** the `caseId` required by
+  `PATCH https://externalapi.uat.benivo.com/clients/v1/Case`.
+- Job Title (`candidates.job_title`, synced from Jobvite) maps to
+  `hostJobRole` on the Case PATCH payload.
+- `create-user` now populates `homeCountry` from `candidates.home_country`
+  (already synced from Jobvite's `candidate_home_country` custom field).
+- The Case PATCH populates `homeLocation.country`, also from
+  `candidates.home_country`.
+- Only these confirmed fields are sent on the Case PATCH (`caseId`,
+  `hostJobRole`, `homeLocation.country`) -- no other Case field has been
+  confirmed, so none is guessed.
+- The Case PATCH is called immediately after a **successful** create-user
+  (see `posting_service.post_single_candidate()`), never for
+  `already_exists` or `failed` outcomes.
+- The Case PATCH is best-effort and independently audited: a failure is
+  recorded as its own `benivo.post_log` row (`action = 'UPDATE_CASE'`,
+  see `migrations/0006`) and never changes the candidate's `POSTED` status
+  set by a successful create-user.
 
 ---
 

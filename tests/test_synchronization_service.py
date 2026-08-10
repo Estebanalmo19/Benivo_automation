@@ -41,6 +41,30 @@ def test_upsert_sql_inserts_start_date_and_workplace():
     assert "workplace" in insert_columns
 
 
+def test_upsert_sql_syncs_home_country_from_candidate_home_country_custom_field():
+    sql = synchronization_service._UPSERT_SQL
+
+    assert "candidate_home_country" in sql
+    assert "home_country = EXCLUDED.home_country" in sql
+
+    insert_columns = sql.split("INSERT INTO benivo.candidates (")[1].split(")")[0]
+    assert "home_country" in insert_columns
+
+
+def test_upsert_sql_syncs_current_country_from_country_name():
+    # Fallback source for the home-country business rule (see
+    # app/services/home_country_service.py) -- must never be confused with
+    # 'location' (a display string) or application.job.location (the job's
+    # location, not the candidate's).
+    sql = synchronization_service._UPSERT_SQL
+
+    assert "countryName" in sql
+    assert "current_country = EXCLUDED.current_country" in sql
+
+    insert_columns = sql.split("INSERT INTO benivo.candidates (")[1].split(")")[0]
+    assert "current_country" in insert_columns
+
+
 def test_delete_out_of_scope_uses_same_eligibility_filter_as_upsert():
     upsert_sql = synchronization_service._UPSERT_SQL
     delete_sql = synchronization_service._DELETE_OUT_OF_SCOPE_SQL

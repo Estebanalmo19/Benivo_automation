@@ -51,7 +51,8 @@ def test_cmd_report_never_posts_for_real_even_if_dry_run_is_false():
          patch("app.main.posting_service.select_postable_candidates", return_value=[{"application_eid": "APP-1"}]) as mock_select, \
          patch("app.main.posting_service.post_candidates", return_value=[{"office_resolved": True, "payload": {}}]) as mock_post, \
          patch("app.main.posting_service.record_post_result") as mock_record, \
-         patch("app.main.reporting_service.generate_reports", return_value="report.xlsx"):
+         patch("app.main.reporting_service.generate_reports", return_value=("report.xlsx", {})), \
+         patch("app.main.report_delivery_service.deliver_report") as mock_deliver:
         exit_code = app_main.main(["report"])
 
     assert exit_code == 0
@@ -59,6 +60,7 @@ def test_cmd_report_never_posts_for_real_even_if_dry_run_is_false():
     # dry_run=True was forced regardless of posting_service.is_dry_run() -> False
     assert mock_post.call_args.kwargs.get("dry_run") is True or mock_post.call_args[0][1] is True
     mock_record.assert_not_called()  # never writes post_log/candidate status
+    mock_deliver.assert_called_once()  # report delivery still attempted, independent of posting
 
 
 def test_cmd_post_records_results_when_not_dry_run():
@@ -68,11 +70,13 @@ def test_cmd_post_records_results_when_not_dry_run():
          patch("app.main.posting_service.select_postable_candidates", return_value=[{"application_eid": "APP-1"}]), \
          patch("app.main.posting_service.post_candidates", return_value=[{"outcome": "success"}]), \
          patch("app.main.posting_service.record_post_result") as mock_record, \
-         patch("app.main.reporting_service.generate_reports", return_value="report.xlsx"):
+         patch("app.main.reporting_service.generate_reports", return_value=("report.xlsx", {})), \
+         patch("app.main.report_delivery_service.deliver_report") as mock_deliver:
         exit_code = app_main.main(["post"])
 
     assert exit_code == 0
     mock_record.assert_called_once()
+    mock_deliver.assert_called_once()
 
 
 def test_cmd_post_skips_recording_when_dry_run():
@@ -82,8 +86,22 @@ def test_cmd_post_skips_recording_when_dry_run():
          patch("app.main.posting_service.select_postable_candidates", return_value=[{"application_eid": "APP-1"}]), \
          patch("app.main.posting_service.post_candidates", return_value=[{"office_resolved": True, "payload": {}}]), \
          patch("app.main.posting_service.record_post_result") as mock_record, \
-         patch("app.main.reporting_service.generate_reports", return_value="report.xlsx"):
+         patch("app.main.reporting_service.generate_reports", return_value=("report.xlsx", {})), \
+         patch("app.main.report_delivery_service.deliver_report") as mock_deliver:
         exit_code = app_main.main(["post"])
 
     assert exit_code == 0
     mock_record.assert_not_called()
+    mock_deliver.assert_called_once()
+
+
+def test_generate_and_deliver_report_calls_delivery_exactly_once():
+    # The single orchestration boundary: one generate_reports() call must
+    # produce exactly one deliver_report() call, regardless of command.
+    with patch("app.main.reporting_service.generate_reports", return_value=("report.xlsx", {"ready_to_post": 1})) as mock_generate, \
+         patch("app.main.report_delivery_service.deliver_report", return_value={"attempted": True, "success": True}) as mock_deliver:
+        report_path = app_main._generate_and_deliver_report([{"application_eid": "APP-1"}], dry_run=True, posting_limit=1, run_id="run-1")
+
+    assert report_path == "report.xlsx"
+    mock_generate.assert_called_once()
+    mock_deliver.assert_called_once_with("report.xlsx", "run-1", {"ready_to_post": 1})

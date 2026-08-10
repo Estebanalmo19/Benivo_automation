@@ -54,3 +54,40 @@ def test_create_user_reports_success():
 
     assert result["success"] is True
     assert result["created"]["benivoId"] == 605070
+
+
+def test_update_case_reports_success():
+    mock_response = MagicMock(status_code=200, content=b"{}")
+    mock_response.json.return_value = {"hasError": False}
+
+    payload = {"caseId": 1010644, "hostJobRole": "Engineer", "homeLocation": {"country": "Serbia"}}
+
+    with patch("app.clients.benivo_client.requests.patch", return_value=mock_response) as mock_patch:
+        result = benivo_client.update_case("fake-token", payload)
+
+    assert result["success"] is True
+    mock_patch.assert_called_once()
+    call_args, call_kwargs = mock_patch.call_args
+    assert call_args[0] == benivo_client.CASE_URL
+    assert call_kwargs["json"] == payload
+
+
+def test_update_case_reports_failure_on_has_error():
+    mock_response = MagicMock(status_code=200, content=b"{}")
+    mock_response.json.return_value = {"hasError": True, "message": "boom"}
+
+    with patch("app.clients.benivo_client.requests.patch", return_value=mock_response):
+        result = benivo_client.update_case("fake-token", {"caseId": 1010644})
+
+    assert result["success"] is False
+    assert result["error"] is not None
+
+
+def test_update_case_reports_failure_on_non_200():
+    mock_response = MagicMock(status_code=500, content=b"{}")
+    mock_response.json.return_value = {"message": "server error"}
+
+    with patch("app.clients.benivo_client.requests.patch", return_value=mock_response):
+        result = benivo_client.update_case("fake-token", {"caseId": 1010644})
+
+    assert result["success"] is False

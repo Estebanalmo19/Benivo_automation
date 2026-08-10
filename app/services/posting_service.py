@@ -8,7 +8,7 @@ validate_uat_candidate() -- instead of the normal SQL-LIMIT bulk selection.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import psycopg2
@@ -16,12 +16,14 @@ import psycopg2
 from app import config
 from app.clients import benivo_client
 from app.clients.database_client import transaction
-from app.models.domain import ACTION_CREATE_USER, POST_LOG_STATUS_TO_CANDIDATE_STATUS
+from app.models.domain import ACTION_CREATE_USER, ACTION_UPDATE_CASE, POST_LOG_STATUS_TO_CANDIDATE_STATUS
 from app.repositories import candidate_repository, post_log_repository
 from app.repositories.candidate_repository import get_candidate_by_application_eid, get_ready_candidates
 from app.repositories.post_log_repository import get_terminal_post_log_application_eids, insert_post_log_row
+from app.services.home_country_service import resolve_effective_home_country
 from app.services.office_resolution_service import resolve_office
 from app.services.policy_service import resolve_policy_values
+from app.services.start_date_service import resolve_effective_start_date
 from app.utils.helpers import mask_email
 
 logger = logging.getLogger(__name__)
@@ -74,13 +76,27 @@ def _validate_payload(payload: Dict[str, Any]) -> bool:
     return all(payload.get(field) for field in required_fields)
 
 
-def validate_uat_candidate(application_eid: str, refdata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def validate_uat_candidate(
+    application_eid: str,
+    refdata: Optional[Dict[str, Any]],
+    execution_timestamp: Optional[datetime] = None,
+) -> Dict[str, Any]:
     """
     Full explicit-candidate safety gate for the one-candidate UAT. Checks
     every required condition individually (rather than a single WHERE
     clause) so a failure can be reported exactly, and builds the sanitized
     pre-post summary. Never substitutes a different candidate.
+
+    execution_timestamp defaults to "now" -- this validates exactly one
+    candidate, so a single internal generation here does not violate the
+    "one execution_timestamp per run, reused for every candidate" rule
+    (there is only one candidate in this path). Callers driving a batch
+    (post_candidates()) generate their own single timestamp and never go
+    through this function.
     """
+    if execution_timestamp is None:
+        execution_timestamp = datetime.now(timezone.utc)
+
     candidate = get_candidate_by_application_eid(application_eid)
 
     checks: Dict[str, bool] = {"candidate_exists": candidate is not None}
@@ -90,7 +106,10 @@ def validate_uat_candidate(application_eid: str, refdata: Optional[Dict[str, Any
 
     checks["workflow_state_is_mobility_in_process"] = candidate.get("workflow_state") == "Mobility in process"
     checks["is_relocation_required_is_yes"] = (candidate.get("is_relocation_required") or "").strip().lower() == "yes"
-    checks["start_date_present"] = candidate.get("start_date") is not None
+
+    effective_start_date, start_date_source = resolve_effective_start_date(candidate.get("start_date"), execution_timestamp)
+    checks["effective_start_date_resolved"] = effective_start_date is not None
+
     checks["benivo_status_is_ready_to_post"] = candidate.get("benivo_status") == "READY_TO_POST"
 
     terminal_eids = get_terminal_post_log_application_eids()
@@ -103,7 +122,7 @@ def validate_uat_candidate(application_eid: str, refdata: Optional[Dict[str, Any
     checks["policy_name_is_basic"] = policy_name == "Basic"
     checks["policy_api_value_confirmed"] = policy_api_value is not None
 
-    payload = build_benivo_payload(candidate, office)
+    payload = build_benivo_payload(candidate, office, effective_start_date)
     payload_valid = _validate_payload(payload)
     checks["payload_valid"] = payload_valid
 
@@ -114,7 +133,9 @@ def validate_uat_candidate(application_eid: str, refdata: Optional[Dict[str, Any
         "workplace": candidate.get("workplace"),
         "resolved_office_name": office.get("officeName") if office else None,
         "resolved_office_id": office.get("officeId") if office else None,
-        "start_date": _format_start_date(candidate.get("start_date")),
+        "start_date": _format_start_date(effective_start_date),
+        "start_date_source": start_date_source,
+        "execution_date": execution_timestamp.isoformat(),
         "is_vip": candidate.get("is_vip"),
         "policy_name": policy_name,
         "policy_api_value": policy_api_value,
@@ -162,15 +183,49 @@ def _select_explicit_uat_candidate(application_eid: str) -> List[Dict[str, Any]]
     return [validation["candidate"]]
 
 
-def build_benivo_payload(candidate: Dict[str, Any], office: Optional[Dict[str, str]]) -> Dict[str, Any]:
+def build_benivo_payload(
+    candidate: Dict[str, Any],
+    office: Optional[Dict[str, str]],
+    effective_start_date: Any,
+) -> Dict[str, Any]:
     """
     "policy" sends policy_api_value (the exact string Benivo's API accepts,
     e.g. "Tier 1"), never policy_name (the business label "Basic"/"VIP").
     If policy_api_value is unconfirmed (currently: any VIP candidate), this
     is None, which _validate_payload() correctly treats as invalid --
     blocking the create-user call rather than sending a guessed value.
+
+    effective_start_date is the already-resolved date (Jobvite-sourced or
+    calculated -- see start_date_service.resolve_effective_start_date()),
+    passed in rather than re-derived here, so this stays a pure formatter
+    and every caller controls exactly which execution_timestamp produced it.
+
+    Job Title: deliberately NOT included in create-user. Investigated and
+    confirmed -- no Benivo API field name for job title exists in this
+    payload (not in refdata, not in any captured create-user request/
+    response, not in legacy/create_user_benivo.py). Confirmed 2026-08-10 by
+    Gina (Benivo): Job Title maps to hostJobRole, but that field belongs to
+    the Case PATCH payload, not create-user -- see
+    build_case_update_payload(). Sending a guessed create-user key risks
+    the same kind of silent rejection "policy": "Basic" caused before
+    "Tier 1" was confirmed.
+
+    homeCountry: confirmed 2026-08-10 by Gina -- create-user must populate
+    it from the candidate's effective home country. Sent as-is with no
+    required-field validation: unlike officeId/policy/etc., a missing
+    value doesn't block posting, it's just sent as None.
+
+    Uses home_country_service.resolve_effective_home_country() (primary:
+    candidates.home_country, synced from Jobvite's candidate_home_country
+    custom field; fallback: candidates.current_country, synced from
+    Jobvite's own countryName field) rather than candidate.get("home_country")
+    directly -- confirmed 2026-08-10 during the Country Data Issues
+    investigation that candidate_home_country alone leaves real gaps
+    current_country reliably fills. See build_case_update_payload(), which
+    uses the exact same resolution for homeLocation.country.
     """
     _, policy_api_value = resolve_policy_values(candidate.get("is_vip"))
+    effective_home_country, _home_country_source = resolve_effective_home_country(candidate)
 
     return {
         "firstName": candidate.get("first_name"),
@@ -179,7 +234,37 @@ def build_benivo_payload(candidate: Dict[str, Any], office: Optional[Dict[str, s
         "policy": policy_api_value,
         "officeId": office["officeId"] if office else None,
         "officeName": office["officeName"] if office else None,
-        "startDateOfAssignment": _format_start_date(candidate.get("start_date")),
+        "startDateOfAssignment": _format_start_date(effective_start_date),
+        "homeCountry": effective_home_country,
+    }
+
+
+def build_case_update_payload(candidate: Dict[str, Any], case_id: Any) -> Dict[str, Any]:
+    """
+    PATCH /clients/v1/Case payload. Confirmed 2026-08-10 by Gina (Benivo):
+      - assignmentId returned by create-user IS the caseId this endpoint
+        requires (case_id is passed in by the caller -- see
+        post_single_candidate(), which uses create_result["created"]["assignmentId"]).
+      - Job Title -> hostJobRole.
+      - effective home country -> homeLocation.country.
+
+    Only these three keys are sent. No other Case field has been confirmed
+    -- guessing one risks the same silent-rejection failure mode that
+    "policy": "Basic" caused before "Tier 1" was confirmed. Values are sent
+    as-is (including None when nothing resolves) -- this call is
+    best-effort and never blocks or reverses the create-user result, see
+    post_single_candidate().
+
+    homeLocation.country uses home_country_service.resolve_effective_home_country()
+    -- the exact same resolution build_benivo_payload() uses for
+    homeCountry -- so both payloads for the same candidate always agree.
+    """
+    effective_home_country, _home_country_source = resolve_effective_home_country(candidate)
+
+    return {
+        "caseId": case_id,
+        "hostJobRole": candidate.get("job_title"),
+        "homeLocation": {"country": effective_home_country},
     }
 
 
@@ -202,9 +287,29 @@ def _sanitize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return sanitized
 
 
-def post_single_candidate(access_token: str, candidate: Dict[str, Any], refdata: Dict[str, Any]) -> Dict[str, Any]:
-    """One real Benivo attempt for one candidate. Never called during dry run (dry_run gates it out)."""
+def post_single_candidate(
+    access_token: str,
+    candidate: Dict[str, Any],
+    refdata: Dict[str, Any],
+    execution_timestamp: datetime,
+) -> Dict[str, Any]:
+    """
+    One real Benivo attempt for one candidate: create-user, then (only on a
+    successful create-user) an immediate follow-up Case PATCH -- see
+    build_case_update_payload(). Never called during dry run (dry_run gates
+    it out).
+
+    execution_timestamp must be the single value generated once by the
+    calling run (see post_candidates()) -- never datetime.now() per call.
+    """
     office = resolve_office(candidate, refdata)
+
+    effective_start_date, start_date_source = resolve_effective_start_date(candidate.get("start_date"), execution_timestamp)
+    audit_fields = {
+        "execution_date": execution_timestamp,
+        "effective_start_date": effective_start_date,
+        "start_date_source": start_date_source,
+    }
 
     if office is None:
         return {
@@ -218,9 +323,10 @@ def post_single_candidate(access_token: str, candidate: Dict[str, Any], refdata:
             "benivo_user_id": None,
             "benivo_assignment_id": None,
             "benivo_profile_url": None,
+            **audit_fields,
         }
 
-    payload = build_benivo_payload(candidate, office)
+    payload = build_benivo_payload(candidate, office, effective_start_date)
 
     if not _validate_payload(payload):
         return {
@@ -234,6 +340,7 @@ def post_single_candidate(access_token: str, candidate: Dict[str, Any], refdata:
             "benivo_user_id": None,
             "benivo_assignment_id": None,
             "benivo_profile_url": None,
+            **audit_fields,
         }
 
     email = candidate.get("email")
@@ -248,6 +355,7 @@ def post_single_candidate(access_token: str, candidate: Dict[str, Any], refdata:
             "benivo_user_id": lookup.get("benivo_user_id"),
             "benivo_assignment_id": lookup.get("benivo_assignment_id"),
             "benivo_profile_url": None,
+            **audit_fields,
         }
 
     create_result = benivo_client.create_user(access_token, payload)
@@ -261,9 +369,37 @@ def post_single_candidate(access_token: str, candidate: Dict[str, Any], refdata:
             "benivo_user_id": None,
             "benivo_assignment_id": None,
             "benivo_profile_url": None,
+            **audit_fields,
         }
 
     created = create_result["created"]
+    case_id = created.get("assignmentId")
+
+    # Immediately follow a successful create-user with the Case PATCH --
+    # confirmed 2026-08-10 by Gina (Benivo) that assignmentId IS the
+    # required caseId. Best-effort: a PATCH failure is recorded (see
+    # build_case_update_post_log_insert()/record_post_result()) but never
+    # changes the create-user outcome or the candidate's POSTED status.
+    case_payload = build_case_update_payload(candidate, case_id)
+    case_patch_result = benivo_client.update_case(access_token, case_payload)
+
+    if not case_patch_result["success"]:
+        logger.error(
+            "Case PATCH failed for application_eid=%s (caseId=%s): %s -- "
+            "create-user already succeeded, candidate status is unaffected.",
+            candidate.get("application_eid"),
+            case_id,
+            case_patch_result.get("error"),
+        )
+
+    case_update = {
+        "attempted": True,
+        "success": case_patch_result["success"],
+        "case_id": case_id,
+        "request_payload": case_payload,
+        "response_payload": case_patch_result.get("raw_response"),
+        "error_message": case_patch_result.get("error"),
+    }
 
     return {
         "outcome": "success",
@@ -271,9 +407,11 @@ def post_single_candidate(access_token: str, candidate: Dict[str, Any], refdata:
         "response_payload": create_result.get("raw_response"),
         "error_message": None,
         "benivo_user_id": created.get("benivoId"),
-        "benivo_assignment_id": created.get("assignmentId"),
+        "benivo_assignment_id": case_id,
         # Not confirmed in any real Benivo response inspected so far.
         "benivo_profile_url": created.get("profileUrl"),
+        "case_update": case_update,
+        **audit_fields,
     }
 
 
@@ -294,7 +432,14 @@ def post_candidates(candidates: List[Dict[str, Any]], dry_run: bool) -> List[Dic
     validated for real; otherwise office resolution is skipped entirely and
     reported as such.
     Real run: fetches one token/refdata, then posts each candidate for real.
+
+    execution_timestamp is generated exactly once here and reused for every
+    candidate in `candidates` -- see start_date_service.resolve_effective_start_date().
     """
+    # Generated once for the whole run and reused for every candidate below
+    # -- never call datetime.now() per-candidate.
+    execution_timestamp = datetime.now(timezone.utc)
+
     if dry_run:
         refdata = None
         refdata_note = "refdata not fetched (BENIVO_ALLOW_REFERENCE_DATA_CALLS is not enabled)"
@@ -312,8 +457,18 @@ def post_candidates(candidates: List[Dict[str, Any]], dry_run: bool) -> List[Dic
 
         for candidate in candidates:
             office = resolve_office(candidate, refdata) if refdata is not None else None
-            payload = build_benivo_payload(candidate, office)
+            effective_start_date, start_date_source = resolve_effective_start_date(
+                candidate.get("start_date"), execution_timestamp
+            )
+            payload = build_benivo_payload(candidate, office, effective_start_date)
             policy_name, policy_api_value = resolve_policy_values(candidate.get("is_vip"))
+
+            # caseId is only known once create-user actually succeeds (it's
+            # the returned assignmentId), so the preview shows the Case
+            # PATCH payload shape with caseId=None -- everything else
+            # (hostJobRole, homeLocation.country) is exactly what would be
+            # sent for real.
+            case_update_payload_preview = build_case_update_payload(candidate, case_id=None)
 
             previews.append(
                 {
@@ -323,7 +478,11 @@ def post_candidates(candidates: List[Dict[str, Any]], dry_run: bool) -> List[Dic
                     "is_vip": candidate.get("is_vip"),
                     "policy_name": policy_name,
                     "policy_api_value": policy_api_value,
+                    "start_date_source": start_date_source,
+                    "effective_start_date": str(effective_start_date) if effective_start_date else None,
+                    "execution_date": execution_timestamp.isoformat(),
                     "payload": _sanitize_payload(payload),
+                    "case_update_payload_preview": case_update_payload_preview,
                 }
             )
 
@@ -335,14 +494,22 @@ def post_candidates(candidates: List[Dict[str, Any]], dry_run: bool) -> List[Dic
     results = []
 
     for candidate in candidates:
-        result = post_single_candidate(access_token, candidate, refdata)
+        result = post_single_candidate(access_token, candidate, refdata, execution_timestamp)
         results.append(result)
 
     return results
 
 
 def build_post_log_insert(run_id: str, candidate: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
-    """Pure: maps a candidate + posting result to the exact benivo.post_log column values. No I/O."""
+    """
+    Pure: maps a candidate + posting result to the exact benivo.post_log
+    column values. No I/O.
+
+    execution_date/effective_start_date/start_date_source come from
+    `result` (set by post_single_candidate()) via .get() -- callers/tests
+    that construct a `result` dict without them (predating this rule) still
+    work, just recording NULL for these three audit columns.
+    """
     post_log_status = _post_log_status_from_outcome(result["outcome"])
     is_vip = candidate.get("is_vip")
     policy_name, policy_api_value = resolve_policy_values(is_vip)
@@ -363,18 +530,77 @@ def build_post_log_insert(run_id: str, candidate: Dict[str, Any], result: Dict[s
         "request_payload": result["request_payload"],
         "response_payload": result["response_payload"],
         "error_message": result["error_message"],
+        "execution_date": result.get("execution_date"),
+        "effective_start_date": result.get("effective_start_date"),
+        "start_date_source": result.get("start_date_source"),
+    }
+
+
+def build_case_update_post_log_insert(run_id: str, candidate: Dict[str, Any], case_update: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Pure: maps a candidate + case_update result (the "case_update" key set
+    by post_single_candidate() on a successful create-user) to a benivo.
+    post_log row with action=UPDATE_CASE. No I/O.
+
+    This is a SEPARATE row from the CREATE_USER row build_post_log_insert()
+    produces -- see migrations/0006, which scopes the terminal-status
+    unique index by (application_eid, action) specifically so this row
+    never collides with the create-user row's own terminal status.
+    policy_name/policy_api_value are not applicable to a Case update (no
+    policy decision is made here) and are left None; is_vip is carried over
+    for informational/audit purposes only.
+    """
+    status = "SUCCESS" if case_update.get("success") else "FAILED"
+
+    return {
+        "run_id": run_id,
+        "application_eid": candidate["application_eid"],
+        "candidate_eid": candidate.get("candidate_eid"),
+        "email": candidate.get("email"),
+        "action": ACTION_UPDATE_CASE,
+        "status": status,
+        "is_vip": candidate.get("is_vip"),
+        "policy_name": None,
+        "policy_api_value": None,
+        "benivo_user_id": None,
+        "benivo_assignment_id": case_update.get("case_id"),
+        "benivo_profile_url": None,
+        "request_payload": case_update.get("request_payload"),
+        "response_payload": case_update.get("response_payload"),
+        "error_message": case_update.get("error_message"),
+        "execution_date": None,
+        "effective_start_date": None,
+        "start_date_source": None,
     }
 
 
 def record_post_result(candidate: Dict[str, Any], result: Dict[str, Any], run_id: str) -> None:
-    """Writes post_log + updates candidate status atomically, in one transaction."""
+    """
+    Writes post_log + updates candidate status atomically, in one
+    transaction. If `result` carries a "case_update" entry (set only when
+    post_single_candidate() attempted the Case PATCH after a successful
+    create-user), a second, independent post_log row (action=UPDATE_CASE)
+    is written in the same transaction.
+
+    candidate_status is derived ONLY from the create-user outcome
+    (post_log_row["status"]) -- a failed Case PATCH is fully audited via
+    the second row but never changes the candidate's POSTED status, per
+    the confirmed rule that a successful create-user always remains POSTED.
+    """
     post_log_row = build_post_log_insert(run_id, candidate, result)
     candidate_status = _candidate_status_from_post_log_status(post_log_row["status"])
     application_eid = post_log_row["application_eid"]
 
+    case_update = result.get("case_update")
+    case_update_row = build_case_update_post_log_insert(run_id, candidate, case_update) if case_update else None
+
     try:
         with transaction() as cur:
             insert_post_log_row(cur, post_log_row)
+
+            if case_update_row is not None:
+                insert_post_log_row(cur, case_update_row)
+
             candidate_repository.update_candidate_after_posting(
                 cur,
                 application_eid=application_eid,

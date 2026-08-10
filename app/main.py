@@ -18,18 +18,25 @@ import argparse
 import logging
 import sys
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from app import config
 from app.logging_config import configure_logging
-from app.services import classification_service, posting_service, reporting_service, synchronization_service
+from app.services import (
+    classification_service,
+    posting_service,
+    report_delivery_service,
+    reporting_service,
+    synchronization_service,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _run_sync() -> None:
+def _run_sync() -> Dict[str, Any]:
     metrics = synchronization_service.sync_candidates()
     logger.info("Sync metrics: %s", metrics)
+    return metrics
 
 
 def _run_classify() -> None:
@@ -79,6 +86,32 @@ def _select_and_post(run_id: str, force_dry_run: Optional[bool] = None):
     return candidates, results, dry_run, posting_limit
 
 
+def _generate_and_deliver_report(
+    candidates: List[Dict[str, Any]],
+    dry_run: bool,
+    posting_limit: int,
+    run_id: str,
+    sync_metrics: Optional[Dict[str, Any]] = None,
+):
+    """
+    The single orchestration boundary for "generate a report, then attempt
+    to deliver it": every command that produces a report (report/post/run)
+    calls this once, so a generated report gets at most one Power Automate
+    delivery attempt. Report generation and delivery are independent
+    concerns -- a delivery failure (see report_delivery_service.py) never
+    affects the return value or raises, so it can never roll back or alter
+    anything this function's caller already did.
+    """
+    report_path, report_metrics = reporting_service.generate_reports(
+        candidates, dry_run, posting_limit, run_id=run_id, sync_metrics=sync_metrics
+    )
+    logger.info("Report generated: %s", report_path)
+
+    report_delivery_service.deliver_report(report_path, run_id, report_metrics)
+
+    return report_path
+
+
 def cmd_sync(_args: argparse.Namespace) -> int:
     _run_sync()
     return 0
@@ -92,17 +125,15 @@ def cmd_classify(_args: argparse.Namespace) -> int:
 def cmd_report(_args: argparse.Namespace) -> int:
     """Never posts for real, regardless of BENIVO_DRY_RUN -- this command only ever produces a report."""
     run_id = str(uuid.uuid4())
-    candidates, results, dry_run, posting_limit = _select_and_post(run_id, force_dry_run=True)
-    report_path = reporting_service.generate_reports(candidates, results, dry_run, posting_limit)
-    logger.info("Report generated: %s", report_path)
+    candidates, _results, dry_run, posting_limit = _select_and_post(run_id, force_dry_run=True)
+    _generate_and_deliver_report(candidates, dry_run, posting_limit, run_id)
     return 0
 
 
 def cmd_post(args: argparse.Namespace) -> int:
     run_id = str(uuid.uuid4())
-    candidates, results, dry_run, posting_limit = _select_and_post(run_id)
-    report_path = reporting_service.generate_reports(candidates, results, dry_run, posting_limit)
-    logger.info("Report generated: %s", report_path)
+    candidates, _results, dry_run, posting_limit = _select_and_post(run_id)
+    _generate_and_deliver_report(candidates, dry_run, posting_limit, run_id)
     return 0
 
 
@@ -111,7 +142,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     logger.info("Run started: run_id=%s", run_id)
 
     try:
-        _run_sync()
+        sync_metrics = _run_sync()
     except Exception:
         logger.error("Aborting: candidate synchronization failed, downstream steps will not run.")
         return 1
@@ -122,9 +153,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         logger.error("Aborting: candidate classification failed, downstream steps will not run.")
         return 1
 
-    candidates, results, dry_run, posting_limit = _select_and_post(run_id)
-    report_path = reporting_service.generate_reports(candidates, results, dry_run, posting_limit)
-    logger.info("Report generated: %s", report_path)
+    candidates, _results, dry_run, posting_limit = _select_and_post(run_id)
+    _generate_and_deliver_report(candidates, dry_run, posting_limit, run_id, sync_metrics=sync_metrics)
     return 0
 
 

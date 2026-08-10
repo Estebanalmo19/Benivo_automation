@@ -17,6 +17,7 @@ TOKEN_URL = "https://externalapi.uat.benivo.com/idm/v1/Token/OAuth2"
 REFDATA_URL = "https://hubapi.uat.benivo.com/v3/api/user/refdata"
 CREATE_USER_URL = "https://hubapi.uat.benivo.com/v3/api/user/create"
 USER_ASSIGNMENT_URL = "https://hubapi.uat.benivo.com/v3/api/user/userassignment"
+CASE_URL = "https://externalapi.uat.benivo.com/clients/v1/Case"
 
 REQUEST_TIMEOUT_SECONDS = 30
 
@@ -138,4 +139,30 @@ def create_user(access_token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     result["success"] = True
     result["created"] = created
+    return result
+
+
+def update_case(access_token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    PATCH /clients/v1/Case. Confirmed 2026-08-10 by Gina (Benivo): the
+    assignmentId from create-user IS the caseId this endpoint requires.
+    Caller sends only confirmed fields (caseId, hostJobRole,
+    homeLocation.country) -- see posting_service.build_case_update_payload().
+    """
+    response = requests.patch(
+        CASE_URL,
+        headers=_get_headers(access_token),
+        json=payload,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+
+    body = response.json() if response.content else {}
+
+    result = {"success": False, "status_code": response.status_code, "raw_response": body, "error": None}
+
+    if response.status_code != 200 or body.get("hasError") is True:
+        result["error"] = json.dumps(body, ensure_ascii=False)
+        return result
+
+    result["success"] = True
     return result

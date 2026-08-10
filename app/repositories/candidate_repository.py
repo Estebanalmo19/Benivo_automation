@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from app import config
 from app.clients.database_client import db_cursor
-from app.models.domain import TERMINAL_POST_LOG_STATUSES
+from app.models.domain import ACTION_CREATE_USER, TERMINAL_POST_LOG_STATUSES
 
 READY_CANDIDATE_FIELDS = """
     c.id, c.application_eid, c.candidate_eid, c.email, c.first_name, c.last_name,
@@ -13,7 +13,7 @@ READY_CANDIDATE_FIELDS = """
     c.phone_number, c.location, c.population, c.vip, c.is_vip, c.gender,
     c.home_country, c.home_state_province, c.home_city, c.country_of_birth,
     c.citizenship, c.employee_id, c.billing_entity, c.host_legal_entity,
-    c.host_business_unit
+    c.host_business_unit, c.current_country
 """
 
 REPORTING_FIELDS = """
@@ -26,7 +26,8 @@ FULL_REPORT_FIELDS = """
     c.id, c.application_eid, c.candidate_eid, c.email, c.first_name, c.last_name,
     c.workflow_state, c.is_relocation_required, c.start_date, c.workplace,
     c.job_title, c.requisition_id, c.department, c.location, c.benivo_status,
-    c.is_vip, c.created_at, c.updated_at
+    c.is_vip, c.home_country, c.home_city, c.phone_number, c.benivo_assignment_id,
+    c.current_country, c.created_at, c.updated_at
 """
 
 
@@ -49,6 +50,7 @@ def get_ready_candidates(limit: Optional[int] = None) -> List[Dict[str, Any]]:
               SELECT 1
               FROM benivo.post_log pl
               WHERE pl.application_eid = c.application_eid
+                AND pl.action = %(create_user_action)s
                 AND pl.status = ANY(%(terminal_statuses)s)
           )
         ORDER BY c.created_at, c.id
@@ -56,7 +58,14 @@ def get_ready_candidates(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """
 
     with db_cursor() as cur:
-        cur.execute(query, {"terminal_statuses": list(TERMINAL_POST_LOG_STATUSES), "limit": max_candidates})
+        cur.execute(
+            query,
+            {
+                "create_user_action": ACTION_CREATE_USER,
+                "terminal_statuses": list(TERMINAL_POST_LOG_STATUSES),
+                "limit": max_candidates,
+            },
+        )
         return [dict(row) for row in cur.fetchall()]
 
 

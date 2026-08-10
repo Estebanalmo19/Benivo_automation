@@ -1,20 +1,37 @@
-"""Operational Excel report: Summary + candidate-level evidence for every classification."""
+"""Operational Excel report: an executive, daily-ops-facing snapshot of the current run.
+
+Each generated workbook represents ONLY the current execution -- candidates
+currently ready, what actually happened this run (pulled live from
+benivo.post_log by run_id, never from an in-memory result list), and current
+data-quality gaps. benivo.post_log is the durable historical source of
+truth; this report is a point-in-time snapshot for people without direct
+database access, not a history store. Anyone wanting trends across many runs
+should query Postgres directly, not diff old Excel files.
+"""
 
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook
+from openpyxl.styles import Font
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app import config
 from app.clients import benivo_client
+from app.models.domain import ACTION_CREATE_USER, ACTION_UPDATE_CASE
 from app.repositories import candidate_repository, post_log_repository
 from app.services import posting_service
+from app.services.home_country_service import (
+    SOURCE_CANDIDATE_HOME_COUNTRY,
+    SOURCE_CURRENT_LOCATION,
+    SOURCE_MISSING,
+    resolve_effective_home_country,
+)
 from app.services.office_resolution_service import resolve_office
-from app.services.policy_service import resolve_policy
+from app.services.policy_service import resolve_policy, resolve_policy_values
+from app.services.start_date_service import resolve_effective_start_date
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +39,9 @@ REPORT_FILENAME_PREFIX = "benivo_operational_report"
 
 MOBILITY_WORKFLOW_STATE = "Mobility in process"
 
+# Used by _build_row() -- Pending Office Mapping and Pending Recruiter
+# Review share this shape. Country Data Issues has its own dedicated shape
+# (see _build_country_data_issue_row()/COUNTRY_DATA_ISSUES_COLUMNS).
 REQUIRED_COLUMNS = [
     "application_eid",
     "candidate_eid",
@@ -30,6 +50,8 @@ REQUIRED_COLUMNS = [
     "workflow_state",
     "is_relocation_required",
     "start_date",
+    "effective_start_date",
+    "start_date_source",
     "workplace",
     "resolved_benivo_office_name",
     "resolved_benivo_office_id",
@@ -43,12 +65,160 @@ REQUIRED_COLUMNS = [
     "selected_for_current_run",
 ]
 
+# "Ready To Post" is the clean, executive-facing operational view -- exactly
+# the columns an ops person needs to review what's about to be posted, no
+# raw payload data. Full payload detail lives in "Payload Preview" instead.
+READY_TO_POST_COLUMNS = [
+    "Application EID",
+    "Candidate Name",
+    "Email",
+    "Workplace",
+    "Resolved Office",
+    "OfficeId",
+    "Host Country",
+    "Candidate Home Country",
+    "Current Country",
+    "Country Sent to Benivo",
+    "Country Source",
+    "Job Title",
+    "Policy",
+    "VIP",
+    "Original Start Date",
+    "Effective Start Date",
+    "Start Date Source",
+    "Payload Ready",
+]
+
+# "Payload Preview" is the technical/troubleshooting sheet: every field the
+# real Benivo integration would use or send, plus data-quality flags. Every
+# create_*/case_* column is pulled directly from posting_service.
+# build_benivo_payload()/build_case_update_payload() -- the exact same
+# functions the real posting path calls -- never rebuilt independently
+# here, so it always reflects exactly what would actually be sent.
+PAYLOAD_PREVIEW_COLUMNS = [
+    # Identity
+    "application_eid",
+    "candidate_eid",
+    "first_name",
+    "last_name",
+    "email",
+    "phone_number",
+    # Jobvite / business data
+    "workflow_state",
+    "is_relocation_required",
+    "job_title",
+    "department",
+    "workplace",
+    "location",
+    "home_country",
+    "current_country",
+    "home_country_source",
+    "home_city",
+    # Start-date data
+    "original_jobvite_start_date",
+    "effective_start_date",
+    "start_date_source",
+    "execution_date",
+    # Benivo resolution
+    "resolved_office_name",
+    "resolved_office_id",
+    "resolved_host_country",
+    "is_vip",
+    "policy_name",
+    "policy_api_value",
+    # Create User payload preview (== posting_service.build_benivo_payload())
+    "create_firstName",
+    "create_lastName",
+    "create_email",
+    "create_homeCountry",
+    "create_policy",
+    "create_officeId",
+    "create_officeName",
+    "create_startDateOfAssignment",
+    # Case PATCH payload preview (== posting_service.build_case_update_payload())
+    "case_caseId_available",
+    "case_hostJobRole",
+    "case_homeLocation_country",
+    # Posting state
+    "benivo_status",
+    "has_terminal_create_user_result",
+    "selected_for_current_run",
+    "ready_reason",
+    # Data quality flags
+    "missing_home_country",
+    "missing_job_title",
+    "missing_effective_start_date",
+    "unresolved_office",
+    "invalid_policy",
+    "ready_to_create_user",
+    "ready_to_update_case",
+    "payload_ready",
+    "reason_not_payload_ready",
+]
+
+# "Posting Results" is built directly from benivo.post_log (see
+# post_log_repository.get_post_log_rows_for_run()), never from an in-memory
+# result list -- it can never diverge from what was actually persisted.
+POSTING_RESULTS_COLUMNS = [
+    "Candidate",
+    "Application EID",
+    "Create User Result",
+    "Case Update Result",
+    "Benivo User Id",
+    "Assignment Id",
+    "Execution Time",
+]
+
+# "Country Data Issues" (formerly "Missing Home Country") -- broader than
+# just missing: a candidate appears here if the country actually sent to
+# Benivo is missing OR came from the fallback (current_country) rather than
+# the primary source (candidate_home_country), so ops can immediately see
+# who's relying on a fallback value.
+COUNTRY_DATA_ISSUES_COLUMNS = [
+    "Application EID",
+    "Candidate Name",
+    "Workflow State",
+    "Candidate Home Country",
+    "Current Country",
+    "Country Sent to Benivo",
+    "Country Source",
+    "Reason",
+    "Operational Status",
+]
+
+NOT_ATTEMPTED = "NOT_ATTEMPTED"
+
+# Shown in case_caseId_available instead of NULL when a READY_TO_POST
+# candidate has never been through create-user yet (the normal case --
+# POSTED is terminal, so a candidate with a real caseId never appears in
+# this sheet again).
+CASE_ID_PENDING_LABEL = "PENDING_CREATE_USER"
+
+# Fields required for payload_ready = TRUE. Deliberately wider than
+# posting_service._validate_payload() (which only gates the real
+# create-user call and does not require homeCountry/officeName/Case
+# fields, since the Case PATCH is best-effort and never blocks or reverses
+# create-user) -- this is a stricter, report-only "fully confirmed
+# integration data" readiness signal, not the actual posting gate.
+CREATE_USER_REQUIRED_FOR_READINESS = (
+    "firstName", "lastName", "email", "homeCountry", "policy", "officeId", "officeName", "startDateOfAssignment",
+)
+
 READY_REASON = "Candidate meets all current posting requirements"
-MISSING_START_DATE_REASON = "Start date is missing while relocation is required"
 RELOCATION_NO_REASON = "Relocation is marked as No and requires recruiter confirmation"
 RELOCATION_UNRECOGNIZED_REASON = "Relocation value is blank or unrecognized and requires recruiter confirmation"
 MISSING_OFFICE_REASON = "No confirmed Benivo office mapping exists for the candidate workplace"
+COUNTRY_ISSUE_MISSING_REASON = (
+    "No country available from Jobvite -- both candidate_home_country and current_country are blank"
+)
+COUNTRY_ISSUE_FALLBACK_REASON = (
+    "Using Jobvite's current-location country (current_country) as a fallback -- candidate_home_country is blank"
+)
 DRY_RUN_NOTE = "No real posting was performed (DRY RUN)."
+
+# Sentinel: a (label, SECTION_HEADER) entry in the Executive Summary's row
+# list renders as a bold section divider instead of a metric/value pair.
+SECTION_HEADER = object()
 
 
 def _report_dir() -> Path:
@@ -82,12 +252,29 @@ def _relocation_bucket(is_relocation_required: Optional[str]) -> str:
     return "blank_or_unrecognized"
 
 
+def _count_with_pct(count: int, denominator: int) -> str:
+    """'826 (98.3%)', or just the raw count when a percentage isn't meaningful (denominator is 0)."""
+    if not denominator:
+        return str(count)
+    return f"{count} ({(count / denominator) * 100:.1f}%)"
+
+
+def _pct(count: int, denominator: int) -> str:
+    if not denominator:
+        return "N/A"
+    return f"{(count / denominator) * 100:.1f}%"
+
+
 def _build_row(
     candidate: Dict[str, Any],
     reason: str,
+    execution_timestamp: datetime,
     office: Optional[Dict[str, str]] = None,
     selected: bool = False,
 ) -> Dict[str, Any]:
+    """Generic candidate-evidence row shared by Pending Office Mapping, Pending Recruiter Review, Missing Home Country."""
+    effective_start_date, start_date_source = resolve_effective_start_date(candidate.get("start_date"), execution_timestamp)
+
     return {
         "application_eid": candidate.get("application_eid"),
         "candidate_eid": candidate.get("candidate_eid"),
@@ -96,6 +283,8 @@ def _build_row(
         "workflow_state": candidate.get("workflow_state"),
         "is_relocation_required": candidate.get("is_relocation_required"),
         "start_date": _excel_safe(candidate.get("start_date")),
+        "effective_start_date": _excel_safe(effective_start_date),
+        "start_date_source": start_date_source,
         "workplace": candidate.get("workplace"),
         "resolved_benivo_office_name": office.get("officeName") if office else None,
         "resolved_benivo_office_id": office.get("officeId") if office else None,
@@ -110,15 +299,222 @@ def _build_row(
     }
 
 
-def _write_table_sheet(ws: Worksheet, rows: List[Dict[str, Any]], empty_note: Optional[str] = None) -> None:
+def _build_country_data_issue_row(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    "Country Data Issues" row -- a candidate appears here (see generate_reports()'s
+    population filter) only when the country actually sent to Benivo is
+    missing, or came from the current_country fallback rather than the
+    primary candidate_home_country field, so ops can immediately see who's
+    relying on a fallback value.
+    """
+    effective_home_country, home_country_source = resolve_effective_home_country(candidate)
+    reason = COUNTRY_ISSUE_MISSING_REASON if home_country_source == SOURCE_MISSING else COUNTRY_ISSUE_FALLBACK_REASON
+
+    return {
+        "Application EID": candidate.get("application_eid"),
+        "Candidate Name": _candidate_name(candidate),
+        "Workflow State": candidate.get("workflow_state"),
+        "Candidate Home Country": candidate.get("home_country"),
+        "Current Country": candidate.get("current_country"),
+        "Country Sent to Benivo": effective_home_country,
+        "Country Source": home_country_source,
+        "Reason": reason,
+        "Operational Status": candidate.get("benivo_status"),
+    }
+
+
+def _build_ready_to_post_row(
+    candidate: Dict[str, Any],
+    office: Optional[Dict[str, str]],
+    execution_timestamp: datetime,
+    payload_ready: bool,
+) -> Dict[str, Any]:
+    """
+    Clean, executive-facing "Ready To Post" row. payload_ready is passed in
+    (computed once by _build_payload_preview_row()) rather than
+    recalculated here, so the two sheets can never disagree about whether a
+    given candidate is actually ready.
+    """
+    effective_start_date, start_date_source = resolve_effective_start_date(candidate.get("start_date"), execution_timestamp)
+    policy_name, _policy_api_value = resolve_policy_values(candidate.get("is_vip"))
+    effective_home_country, home_country_source = resolve_effective_home_country(candidate)
+
+    return {
+        "Application EID": candidate.get("application_eid"),
+        "Candidate Name": _candidate_name(candidate),
+        "Email": candidate.get("email"),
+        "Workplace": candidate.get("workplace"),
+        "Resolved Office": office.get("officeName") if office else None,
+        "OfficeId": office.get("officeId") if office else None,
+        "Host Country": office.get("hostCountry") if office else None,
+        "Candidate Home Country": candidate.get("home_country"),
+        "Current Country": candidate.get("current_country"),
+        "Country Sent to Benivo": effective_home_country,
+        "Country Source": home_country_source,
+        "Job Title": candidate.get("job_title"),
+        "Policy": policy_name,
+        "VIP": candidate.get("is_vip"),
+        "Original Start Date": _excel_safe(candidate.get("start_date")),
+        "Effective Start Date": _excel_safe(effective_start_date),
+        "Start Date Source": start_date_source,
+        "Payload Ready": payload_ready,
+    }
+
+
+def _build_payload_preview_row(
+    candidate: Dict[str, Any],
+    office: Optional[Dict[str, str]],
+    execution_timestamp: datetime,
+    selected: bool,
+    terminal_eids: set,
+) -> Dict[str, Any]:
+    """
+    "Payload Preview" row: every field the Benivo integration would
+    actually use or send, plus data-quality flags. create_*/case_* preview
+    columns come from posting_service.build_benivo_payload()/
+    build_case_update_payload() -- the exact same functions the real
+    posting path calls -- never rebuilt independently here.
+    """
+    effective_start_date, start_date_source = resolve_effective_start_date(candidate.get("start_date"), execution_timestamp)
+
+    create_payload = posting_service.build_benivo_payload(candidate, office, effective_start_date)
+
+    # caseId is only known once create-user has actually run (it's the
+    # returned assignmentId, persisted as candidates.benivo_assignment_id).
+    # A READY_TO_POST candidate has never been created yet -- labeled
+    # PENDING_CREATE_USER rather than left as a bare NULL.
+    case_id = candidate.get("benivo_assignment_id")
+    case_payload = posting_service.build_case_update_payload(candidate, case_id)
+    case_home_country = (case_payload.get("homeLocation") or {}).get("country")
+
+    policy_name, policy_api_value = resolve_policy_values(candidate.get("is_vip"))
+    _effective_home_country, home_country_source = resolve_effective_home_country(candidate)
+
+    unresolved_office = office is None
+    invalid_policy = policy_api_value is None
+
+    missing_create_fields = [field for field in CREATE_USER_REQUIRED_FOR_READINESS if not create_payload.get(field)]
+    ready_to_create_user = not missing_create_fields
+
+    missing_case_fields = []
+    if not case_payload.get("hostJobRole"):
+        missing_case_fields.append("hostJobRole")
+    if not case_home_country:
+        missing_case_fields.append("homeLocation.country")
+    ready_to_update_case = not missing_case_fields
+
+    payload_ready = ready_to_create_user and ready_to_update_case
+
+    reason_parts = []
+    if missing_create_fields:
+        reason_parts.append("Create User missing: " + ", ".join(missing_create_fields))
+    if missing_case_fields:
+        reason_parts.append("Case Update missing: " + ", ".join(missing_case_fields))
+    reason_not_payload_ready = "; ".join(reason_parts)
+
+    return {
+        "application_eid": candidate.get("application_eid"),
+        "candidate_eid": candidate.get("candidate_eid"),
+        "first_name": candidate.get("first_name"),
+        "last_name": candidate.get("last_name"),
+        "email": candidate.get("email"),
+        "phone_number": candidate.get("phone_number"),
+        "workflow_state": candidate.get("workflow_state"),
+        "is_relocation_required": candidate.get("is_relocation_required"),
+        "job_title": candidate.get("job_title"),
+        "department": candidate.get("department"),
+        "workplace": candidate.get("workplace"),
+        "location": candidate.get("location"),
+        "home_country": candidate.get("home_country"),
+        "current_country": candidate.get("current_country"),
+        "home_country_source": home_country_source,
+        "home_city": candidate.get("home_city"),
+        "original_jobvite_start_date": _excel_safe(candidate.get("start_date")),
+        "effective_start_date": _excel_safe(effective_start_date),
+        "start_date_source": start_date_source,
+        "execution_date": _excel_safe(execution_timestamp),
+        "resolved_office_name": office.get("officeName") if office else None,
+        "resolved_office_id": office.get("officeId") if office else None,
+        "resolved_host_country": office.get("hostCountry") if office else None,
+        "is_vip": candidate.get("is_vip"),
+        "policy_name": policy_name,
+        "policy_api_value": policy_api_value,
+        "create_firstName": create_payload.get("firstName"),
+        "create_lastName": create_payload.get("lastName"),
+        "create_email": create_payload.get("email"),
+        "create_homeCountry": create_payload.get("homeCountry"),
+        "create_policy": create_payload.get("policy"),
+        "create_officeId": create_payload.get("officeId"),
+        "create_officeName": create_payload.get("officeName"),
+        "create_startDateOfAssignment": create_payload.get("startDateOfAssignment"),
+        "case_caseId_available": case_id if case_id is not None else CASE_ID_PENDING_LABEL,
+        "case_hostJobRole": case_payload.get("hostJobRole"),
+        "case_homeLocation_country": case_home_country,
+        "benivo_status": candidate.get("benivo_status"),
+        "has_terminal_create_user_result": candidate.get("application_eid") in terminal_eids,
+        "selected_for_current_run": "Yes" if selected else "No",
+        "ready_reason": READY_REASON,
+        # Reflects the EFFECTIVE value (post-fallback), not just the primary
+        # candidate_home_country field -- home_country_source (above)
+        # already distinguishes "used the primary" from "used the fallback".
+        "missing_home_country": home_country_source == SOURCE_MISSING,
+        "missing_job_title": not candidate.get("job_title"),
+        "missing_effective_start_date": effective_start_date is None,
+        "unresolved_office": unresolved_office,
+        "invalid_policy": invalid_policy,
+        "ready_to_create_user": ready_to_create_user,
+        "ready_to_update_case": ready_to_update_case,
+        "payload_ready": payload_ready,
+        "reason_not_payload_ready": reason_not_payload_ready,
+    }
+
+
+def _group_post_log_rows_by_candidate(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    grouped: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for row in rows:
+        grouped.setdefault(row["application_eid"], {})[row["action"]] = row
+
+    return grouped
+
+
+def _build_posting_results_row(
+    application_eid: str,
+    actions: Dict[str, Dict[str, Any]],
+    candidates_by_eid: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    create_row = actions.get(ACTION_CREATE_USER)
+    case_row = actions.get(ACTION_UPDATE_CASE)
+    candidate = candidates_by_eid.get(application_eid, {})
+    execution_time = create_row["posted_at"] if create_row else (case_row["posted_at"] if case_row else None)
+
+    return {
+        "Candidate": _candidate_name(candidate) or application_eid,
+        "Application EID": application_eid,
+        "Create User Result": create_row["status"] if create_row else NOT_ATTEMPTED,
+        "Case Update Result": case_row["status"] if case_row else NOT_ATTEMPTED,
+        "Benivo User Id": create_row.get("benivo_user_id") if create_row else None,
+        "Assignment Id": create_row.get("benivo_assignment_id") if create_row else None,
+        "Execution Time": _excel_safe(execution_time),
+    }
+
+
+def _write_table_sheet(
+    ws: Worksheet,
+    rows: List[Dict[str, Any]],
+    empty_note: Optional[str] = None,
+    columns: Optional[List[str]] = None,
+) -> None:
+    columns = columns or REQUIRED_COLUMNS
+
     if not rows and empty_note:
         ws.append([empty_note])
         return
 
-    ws.append(REQUIRED_COLUMNS)
+    ws.append(columns)
 
     for row in rows:
-        ws.append([row.get(column) for column in REQUIRED_COLUMNS])
+        ws.append([row.get(column) for column in columns])
 
     for column_cells in ws.columns:
         column_letter = column_cells[0].column_letter
@@ -126,14 +522,25 @@ def _write_table_sheet(ws: Worksheet, rows: List[Dict[str, Any]], empty_note: Op
         ws.column_dimensions[column_letter].width = min(max_length + 2, 60)
 
 
-def _write_summary_sheet(ws: Worksheet, summary: Dict[str, Any]) -> None:
-    ws.append(["metric", "value"])
+def _write_summary_sheet(ws: Worksheet, rows: List[Any]) -> None:
+    """
+    rows: ordered (label, value) pairs. A pair whose value is SECTION_HEADER
+    renders as a bold section divider (blank spacer row + bold label row)
+    instead of a metric/value row.
+    """
+    ws.append(["Metric", "Value"])
 
-    for key, value in summary.items():
-        ws.append([key, value])
+    for label, value in rows:
+        if value is SECTION_HEADER:
+            ws.append([])
+            ws.append([label])
+            ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+            continue
 
-    ws.column_dimensions["A"].width = 40
-    ws.column_dimensions["B"].width = 30
+        ws.append([label, value])
+
+    ws.column_dimensions["A"].width = 45
+    ws.column_dimensions["B"].width = 35
 
 
 def _fetch_refdata_if_allowed() -> Optional[Dict[str, Any]]:
@@ -151,54 +558,78 @@ def _fetch_refdata_if_allowed() -> Optional[Dict[str, Any]]:
         return None
 
 
-def _posting_result_row(candidate: Dict[str, Any], result: Dict[str, Any], selected: bool) -> Dict[str, Any]:
-    status = posting_service._post_log_status_from_outcome(result["outcome"])
-
-    reasons = {
-        "SUCCESS": "Candidate successfully created in Benivo.",
-        "ALREADY_EXISTS": "Candidate already exists in Benivo.",
-        "FAILED": result.get("error_message") or "Posting attempt failed.",
-    }
-
-    office = None
-    if result.get("benivo_user_id") is not None or result.get("request_payload"):
-        office = {
-            "officeName": (result.get("request_payload") or {}).get("officeName"),
-            "officeId": (result.get("request_payload") or {}).get("officeId"),
-        }
-
-    row = _build_row(candidate, reasons.get(status, status), office=office, selected=selected)
-    row["benivo_status"] = status
-    return row
-
-
 def generate_reports(
     selected_candidates: List[Dict[str, Any]],
-    posting_results: List[Dict[str, Any]],
     dry_run: bool,
     posting_limit: int,
-) -> Path:
+    run_id: str,
+    sync_metrics: Optional[Dict[str, Any]] = None,
+) -> Tuple[Path, Dict[str, Any]]:
     """
     Build the operational Excel report from the current synchronized/classified
-    data plus this run's selection and posting outcome. Must be called AFTER
+    data plus this run's selection. Must be called AFTER
     select_postable_candidates()/post_candidates() so selected_for_current_run
-    and the posting-outcome counts reflect the actual current execution.
+    reflects the actual current execution.
+
+    Returns (report_path, report_metrics). report_metrics is a small dict of
+    already-computed summary numbers (ready_to_post, posted, already_exists,
+    failed, pending_recruiter_review, pending_office_mapping,
+    country_fallback) -- this is the ONLY thing report_delivery_service.py
+    is allowed to use for its Power Automate summary payload; it never
+    recalculates business logic itself. This function performs NO delivery
+    or other I/O beyond generating and saving the workbook -- see
+    app/services/report_delivery_service.py and app/main.py's single
+    orchestration boundary for that.
+
+    run_id identifies this execution's rows in benivo.post_log -- the
+    "Posting Results" sheet is queried directly from there (see
+    post_log_repository.get_post_log_rows_for_run()), never from an
+    in-memory result list, so it can never diverge from what was actually
+    persisted. A dry run never writes post_log rows, so this naturally
+    comes back empty for a dry-run report.
+
+    sync_metrics is the dict returned by synchronization_service.
+    sync_candidates() when sync ran as part of THIS execution (only
+    "app.main run" does this) -- there is no persistent sync audit trail,
+    so "Candidates Synced"/"Candidates Removed" can only be reported when
+    sync actually happened in this same process. Omit it (cmd_post/
+    cmd_report never call sync) and the Executive Summary shows an
+    explicit "sync not run this execution" note instead of a fabricated 0.
     """
+    # Generated once for the whole report and reused for every candidate/row
+    # below -- never call datetime.now() per-candidate. See
+    # start_date_service.resolve_effective_start_date().
+    execution_timestamp = datetime.now(timezone.utc)
+
     all_candidates = candidate_repository.get_all_candidates_for_report()
     terminal_eids = post_log_repository.get_terminal_post_log_application_eids()
     selected_eids = {c.get("application_eid") for c in selected_candidates}
+    candidates_by_eid = {c.get("application_eid"): c for c in all_candidates}
 
     mobility_candidates = [c for c in all_candidates if c.get("workflow_state") == MOBILITY_WORKFLOW_STATE]
 
     vip_candidates = sum(1 for c in all_candidates if c.get("is_vip") is True)
-    basic_candidates = len(all_candidates) - vip_candidates
 
     relocation_yes, relocation_no, relocation_unrecognized = [], [], []
     for candidate in mobility_candidates:
         bucket = _relocation_bucket(candidate.get("is_relocation_required"))
         {"yes": relocation_yes, "no": relocation_no, "blank_or_unrecognized": relocation_unrecognized}[bucket].append(candidate)
 
-    relocation_yes_with_start_date = [c for c in relocation_yes if c.get("start_date")]
+    # Start-date provenance: still computed (feeds the Executive Summary
+    # KPIs and the Start Date Source column on Ready To Post), but no
+    # longer split into their own standalone sheets -- see the 2026-08-10
+    # report redesign: this duplicated the Ready To Post population split
+    # only by one column that already lives on every row there.
+    jobvite_start_date_count = 0
+    calculated_start_date_count = 0
+
+    for candidate in relocation_yes:
+        _effective_start_date, start_date_source = resolve_effective_start_date(candidate.get("start_date"), execution_timestamp)
+
+        if start_date_source == "JOBVITE":
+            jobvite_start_date_count += 1
+        elif start_date_source == "CALCULATED":
+            calculated_start_date_count += 1
 
     # Sheet placement reads the already-persisted benivo_status directly.
     # classification_service is the single place that decides READY_TO_POST
@@ -206,7 +637,6 @@ def generate_reports(
     # mapping) -- this report displays that decision, it does not re-derive it.
     ready_to_post_population = [c for c in mobility_candidates if c.get("benivo_status") == "READY_TO_POST"]
     pending_office_mapping_population = [c for c in mobility_candidates if c.get("benivo_status") == "PENDING_OFFICE_MAPPING"]
-    pending_missing_start_date_population = [c for c in mobility_candidates if c.get("benivo_status") == "PENDING_MISSING_START_DATE"]
 
     refdata = _fetch_refdata_if_allowed()
 
@@ -214,6 +644,7 @@ def generate_reports(
     # lookup), not a readiness decision -- readiness was already decided by
     # classification_service and is reflected in ready_to_post_population.
     ready_to_post_rows: List[Dict[str, Any]] = []
+    payload_preview_rows: List[Dict[str, Any]] = []
     terminal_in_ready_population = 0
 
     for candidate in ready_to_post_population:
@@ -225,84 +656,144 @@ def generate_reports(
 
         selected = application_eid in selected_eids
         office = resolve_office(candidate, refdata) if refdata is not None else None
-        ready_to_post_rows.append(_build_row(candidate, READY_REASON, office=office, selected=selected))
+
+        preview_row = _build_payload_preview_row(candidate, office, execution_timestamp, selected=selected, terminal_eids=terminal_eids)
+        payload_preview_rows.append(preview_row)
+
+        ready_to_post_rows.append(
+            _build_ready_to_post_row(candidate, office, execution_timestamp, payload_ready=preview_row["payload_ready"])
+        )
 
     missing_office_rows = [
-        _build_row(c, MISSING_OFFICE_REASON, selected=c.get("application_eid") in selected_eids)
+        _build_row(c, MISSING_OFFICE_REASON, execution_timestamp, selected=c.get("application_eid") in selected_eids)
         for c in pending_office_mapping_population
     ]
 
-    missing_start_date_rows = [
-        _build_row(c, MISSING_START_DATE_REASON, selected=c.get("application_eid") in selected_eids)
-        for c in pending_missing_start_date_population
-    ]
-
     relocation_review_rows = [
-        _build_row(c, RELOCATION_NO_REASON, selected=c.get("application_eid") in selected_eids)
+        _build_row(c, RELOCATION_NO_REASON, execution_timestamp, selected=c.get("application_eid") in selected_eids)
         for c in relocation_no
     ] + [
-        _build_row(c, RELOCATION_UNRECOGNIZED_REASON, selected=c.get("application_eid") in selected_eids)
+        _build_row(c, RELOCATION_UNRECOGNIZED_REASON, execution_timestamp, selected=c.get("application_eid") in selected_eids)
         for c in relocation_unrecognized
     ]
 
-    candidates_by_eid = {c.get("application_eid"): c for c in all_candidates}
-    posting_result_rows = []
+    # Country Data Issues: independent of benivo_status -- includes
+    # READY_TO_POST candidates as well as any PENDING_OFFICE_MAPPING/POSTED
+    # candidate with a country issue, so the sheet and its Executive
+    # Summary counts always match exactly. A candidate lands here only if
+    # the EFFECTIVE country is missing, or came from the current_country
+    # fallback rather than the primary candidate_home_country field.
+    country_source_counts = {SOURCE_CANDIDATE_HOME_COUNTRY: 0, SOURCE_CURRENT_LOCATION: 0, SOURCE_MISSING: 0}
+    country_data_issue_candidates = []
 
-    for candidate, result in zip(selected_candidates, posting_results):
-        if "outcome" not in result:
-            continue  # dry-run preview rows have no real outcome -- excluded, per DRY_RUN_NOTE below
+    for candidate in relocation_yes:
+        _effective_home_country, home_country_source = resolve_effective_home_country(candidate)
+        country_source_counts[home_country_source] += 1
 
-        full_candidate = candidates_by_eid.get(candidate.get("application_eid"), candidate)
-        posting_result_rows.append(_posting_result_row(full_candidate, result, selected=True))
+        if home_country_source != SOURCE_CANDIDATE_HOME_COUNTRY:
+            country_data_issue_candidates.append(candidate)
 
-    posting_success = sum(1 for r in posting_result_rows if r["benivo_status"] == "SUCCESS")
-    posting_already_exists = sum(1 for r in posting_result_rows if r["benivo_status"] == "ALREADY_EXISTS")
-    posting_failed = sum(1 for r in posting_result_rows if r["benivo_status"] == "FAILED")
+    country_data_issue_rows = [_build_country_data_issue_row(c) for c in country_data_issue_candidates]
+
+    # Posting Results: queried directly from benivo.post_log by run_id --
+    # never from an in-memory result list. Empty for a dry run (nothing was
+    # ever written under this run_id).
+    post_log_rows = post_log_repository.get_post_log_rows_for_run(run_id)
+    grouped_post_log = _group_post_log_rows_by_candidate(post_log_rows)
+    posting_results_rows = [
+        _build_posting_results_row(application_eid, actions, candidates_by_eid)
+        for application_eid, actions in grouped_post_log.items()
+    ]
+
+    create_user_rows = [row for row in post_log_rows if row["action"] == ACTION_CREATE_USER]
+    posting_success = sum(1 for row in create_user_rows if row["status"] == "SUCCESS")
+    posting_already_exists = sum(1 for row in create_user_rows if row["status"] == "ALREADY_EXISTS")
+    posting_failed = sum(1 for row in create_user_rows if row["status"] == "FAILED")
+    posting_attempted = len(create_user_rows)
 
     terminal_already_processed = sum(1 for c in all_candidates if c.get("application_eid") in terminal_eids)
 
-    summary = {
-        "report_generated_at": _excel_safe(datetime.now(timezone.utc)),
-        "total_current_candidates": len(all_candidates),
-        "total_workflow_mobility_in_process": len(mobility_candidates),
-        "vip_candidates": vip_candidates,
-        "basic_candidates": basic_candidates,
-        "relocation_yes": len(relocation_yes),
-        "relocation_no": len(relocation_no),
-        "relocation_blank_or_unrecognized": len(relocation_unrecognized),
-        "relocation_yes_with_start_date": len(relocation_yes_with_start_date),
-        "start_date_present": len(relocation_yes_with_start_date),
-        "start_date_missing": len(relocation_yes) - len(relocation_yes_with_start_date),
-        "ready_to_post": len(ready_to_post_rows),
-        "pending_office_mapping": len(pending_office_mapping_population),
-        "pending_missing_start_date": len(pending_missing_start_date_population),
-        "relocation_requires_review": len(relocation_no) + len(relocation_unrecognized),
-        "office_mapping_resolved": len(ready_to_post_rows),
-        "office_mapping_unresolved": len(pending_office_mapping_population),
-        "terminal_already_processed": terminal_already_processed,
-        "selected_for_current_run": len(selected_eids),
-        "posting_limit": posting_limit,
-        "dry_run": dry_run,
-        "posting_success_current_run": posting_success,
-        "posting_already_exists_current_run": posting_already_exists,
-        "posting_failed_current_run": posting_failed,
-    }
+    # Data-quality rollup over the Payload Preview population -- mirrors the
+    # per-row flags in _build_payload_preview_row() so these counts are
+    # visible in the Executive Summary without opening the detail sheet.
+    ready_payload_ready = sum(1 for r in payload_preview_rows if r["payload_ready"])
+    ready_missing_home_country = sum(1 for r in payload_preview_rows if r["missing_home_country"])
+    ready_missing_job_title = sum(1 for r in payload_preview_rows if r["missing_job_title"])
+    ready_unresolved_office = sum(1 for r in payload_preview_rows if r["unresolved_office"])
+    ready_to_create_user_count = sum(1 for r in payload_preview_rows if r["ready_to_create_user"])
+    ready_to_update_case_count = sum(1 for r in payload_preview_rows if r["ready_to_update_case"])
+
+    total_candidates = len(all_candidates)
+    ready_to_post_count = len(ready_to_post_rows)
+    pending_office_mapping_count = len(pending_office_mapping_population)
+    pending_recruiter_review_count = len(relocation_no) + len(relocation_unrecognized)
+
+    if sync_metrics is None:
+        candidates_synced_display: Any = "N/A (sync not run this execution)"
+        candidates_removed_display: Any = "N/A (sync not run this execution)"
+    else:
+        candidates_synced_display = sync_metrics.get("inserted_or_updated", "N/A")
+        candidates_removed_display = sync_metrics.get("removed", "N/A")
+
+    summary_rows: List[Any] = [
+        ("Run Timestamp", _excel_safe(execution_timestamp)),
+        ("Run Mode", "DRY RUN" if dry_run else "REAL"),
+        ("Total Candidates", total_candidates),
+        ("Candidates Synced", candidates_synced_display),
+        ("Candidates Removed", candidates_removed_display),
+        ("Ready To Post", _count_with_pct(ready_to_post_count, total_candidates)),
+        ("Successfully Posted", _count_with_pct(posting_success, posting_attempted)),
+        ("Already Exists", _count_with_pct(posting_already_exists, posting_attempted)),
+        ("Failed", _count_with_pct(posting_failed, posting_attempted)),
+        ("Pending Recruiter Review", _count_with_pct(pending_recruiter_review_count, total_candidates)),
+        ("Pending Office Mapping", _count_with_pct(pending_office_mapping_count, total_candidates)),
+        ("Country Source Distribution", SECTION_HEADER),
+        ("Candidate Home Country", _count_with_pct(country_source_counts[SOURCE_CANDIDATE_HOME_COUNTRY], len(relocation_yes))),
+        ("Current Location Fallback", _count_with_pct(country_source_counts[SOURCE_CURRENT_LOCATION], len(relocation_yes))),
+        ("Missing", _count_with_pct(country_source_counts[SOURCE_MISSING], len(relocation_yes))),
+        ("Jobvite Start Date", _count_with_pct(jobvite_start_date_count, len(relocation_yes))),
+        ("Calculated Start Date", _count_with_pct(calculated_start_date_count, len(relocation_yes))),
+        ("Data Quality", SECTION_HEADER),
+        ("Office Mapping Completeness", _pct(ready_to_post_count, ready_to_post_count + pending_office_mapping_count)),
+        ("Home Country Completeness (Effective, Ready To Post)", _pct(ready_to_post_count - ready_missing_home_country, ready_to_post_count)),
+        ("Job Title Completeness (Ready To Post)", _pct(ready_to_post_count - ready_missing_job_title, ready_to_post_count)),
+        ("Ready To Create User (Ready To Post)", _pct(ready_to_create_user_count, ready_to_post_count)),
+        ("Ready To Update Case (Ready To Post)", _pct(ready_to_update_case_count, ready_to_post_count)),
+        ("Fully Payload Ready (Ready To Post)", _pct(ready_payload_ready, ready_to_post_count)),
+    ]
 
     wb = Workbook()
 
     summary_ws = wb.active
-    summary_ws.title = "Summary"
-    _write_summary_sheet(summary_ws, summary)
+    summary_ws.title = "Executive Summary"
+    _write_summary_sheet(summary_ws, summary_rows)
 
-    _write_table_sheet(wb.create_sheet("Ready to Post"), ready_to_post_rows)
-    _write_table_sheet(wb.create_sheet("Missing Start Date"), missing_start_date_rows)
-    _write_table_sheet(wb.create_sheet("Relocation Field Review"), relocation_review_rows)
-    _write_table_sheet(wb.create_sheet("Missing Office Mapping"), missing_office_rows)
+    _write_table_sheet(wb.create_sheet("Ready To Post"), ready_to_post_rows, columns=READY_TO_POST_COLUMNS)
     _write_table_sheet(
         wb.create_sheet("Posting Results"),
-        posting_result_rows,
+        posting_results_rows,
         empty_note=DRY_RUN_NOTE if dry_run else "No posting attempts were recorded in this run.",
+        columns=POSTING_RESULTS_COLUMNS,
     )
+    # Exception-only sheets: a worksheet is created only when it has rows --
+    # a clean state (e.g. Pending Office Mapping = 0) is still fully visible
+    # as a KPI = 0 in the Executive Summary, it just doesn't get an empty
+    # worksheet cluttering the workbook. Ready To Post, Posting Results, and
+    # Payload Preview are core sheets and are always created.
+    if missing_office_rows:
+        _write_table_sheet(wb.create_sheet("Pending Office Mapping"), missing_office_rows)
+
+    if relocation_review_rows:
+        _write_table_sheet(wb.create_sheet("Pending Recruiter Review"), relocation_review_rows)
+
+    if country_data_issue_rows:
+        _write_table_sheet(
+            wb.create_sheet("Country Data Issues"),
+            country_data_issue_rows,
+            columns=COUNTRY_DATA_ISSUES_COLUMNS,
+        )
+
+    _write_table_sheet(wb.create_sheet("Payload Preview"), payload_preview_rows, columns=PAYLOAD_PREVIEW_COLUMNS)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     report_path = _report_dir() / f"{REPORT_FILENAME_PREFIX}_{timestamp}.xlsx"
@@ -310,13 +801,26 @@ def generate_reports(
     wb.save(report_path)
 
     logger.info(
-        "Report generated: %s (ready_to_post=%d, missing_start_date=%d, relocation_review=%d, missing_office_mapping=%d, posting_results=%d).",
+        "Report generated: %s (ready_to_post=%d, pending_office_mapping=%d, pending_recruiter_review=%d, "
+        "country_data_issues=%d, posting_results=%d, terminal_already_processed=%d, terminal_in_ready_population=%d).",
         report_path,
-        len(ready_to_post_rows),
-        len(missing_start_date_rows),
-        len(relocation_review_rows),
-        len(missing_office_rows),
-        len(posting_result_rows),
+        ready_to_post_count,
+        pending_office_mapping_count,
+        pending_recruiter_review_count,
+        len(country_data_issue_rows),
+        len(posting_results_rows),
+        terminal_already_processed,
+        terminal_in_ready_population,
     )
 
-    return report_path
+    report_metrics = {
+        "ready_to_post": ready_to_post_count,
+        "posted": posting_success,
+        "already_exists": posting_already_exists,
+        "failed": posting_failed,
+        "pending_recruiter_review": pending_recruiter_review_count,
+        "pending_office_mapping": pending_office_mapping_count,
+        "country_fallback": country_source_counts[SOURCE_CURRENT_LOCATION],
+    }
+
+    return report_path, report_metrics

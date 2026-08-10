@@ -94,5 +94,15 @@ def report_folder() -> Optional[str]:
     return os.getenv("REPORT_FOLDER") or None
 
 
+def report_delivery_enabled() -> bool:
+    return env_flag("BENIVO_REPORT_DELIVERY_ENABLED", default=False)
+
+
+def report_webhook_url() -> Optional[str]:
+    """The signed Power Automate trigger URL. Never log or return this value -- see report_delivery_service.py."""
+    raw = os.getenv("BENIVO_REPORT_WEBHOOK_URL")
+    return raw.strip() if raw and raw.strip() else None
+
+
 def log_level() -> str:
     return os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"

@@ -38,6 +38,13 @@ POST_LOG_STATUS_TO_CANDIDATE_STATUS = {
 
 ACTION_CREATE_USER = "CREATE_USER"
 
+# Case update follow-up call (PATCH /clients/v1/Case), made immediately
+# after a successful create-user. Recorded as its own post_log action/row
+# -- see migrations/0006 -- so it never collides with the create-user row's
+# terminal-status idempotency index, and a PATCH failure never overwrites
+# the create-user outcome.
+ACTION_UPDATE_CASE = "UPDATE_CASE"
+
 # --- Policy ------------------------------------------------------------------
 POLICY_BASIC = "Basic"
 POLICY_VIP = "VIP"

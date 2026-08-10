@@ -22,22 +22,30 @@ UAT_OFFICES = [
 
 
 @pytest.mark.parametrize(
-    "jobvite_workplace, expected_office_name, expected_office_id",
+    "jobvite_workplace, expected_office_name, expected_office_id, expected_host_country",
     [
-        ("RAK Live Casino", "UAE (Live Casino)", "ca081aff-d1f3-407a-afdd-adb836563d31"),
-        ("Serbia Live Casino", "Serbia (Live Casino)", "68da6b8b-1e07-4742-9333-a882e284c3fb"),
-        ("Colombia Live Casino", "Colombia (Live Casino)", "d715fdb6-c93c-4940-a076-918214ca152d"),
-        ("Bulgaria Live Casino", "Bulgaria (Live Casino)", "32efc23b-9a5b-4c9d-a304-747c7844a584"),
-        ("Malta", "Malta (Global)", "e59774f5-5852-4d83-b655-c7d4410d65d8"),
+        ("RAK Live Casino", "UAE (Live Casino)", "ca081aff-d1f3-407a-afdd-adb836563d31", "UAE"),
+        ("Serbia Live Casino", "Serbia (Live Casino)", "68da6b8b-1e07-4742-9333-a882e284c3fb", "Serbia"),
+        ("Colombia Live Casino", "Colombia (Live Casino)", "d715fdb6-c93c-4940-a076-918214ca152d", "Colombia"),
+        ("Bulgaria Live Casino", "Bulgaria (Live Casino)", "32efc23b-9a5b-4c9d-a304-747c7844a584", "Bulgaria"),
+        ("Malta", "Malta (Global)", "e59774f5-5852-4d83-b655-c7d4410d65d8", "Malta"),
+        ("Romania Live Casino", "Romania (Live Casino)", "b732127f-8a3a-4d99-bf0e-95c24fa69f55", "Romania"),
+        ("Latvia", "Latvia (Global)", "e908ab8d-0046-43f4-9ead-6a8dfb4b0876", "Latvia"),
     ],
 )
-def test_resolve_office_translates_and_retrieves_real_uuid(jobvite_workplace, expected_office_name, expected_office_id):
+def test_resolve_office_translates_and_retrieves_real_uuid(
+    jobvite_workplace, expected_office_name, expected_office_id, expected_host_country
+):
     candidate = {"workplace": jobvite_workplace}
     refdata = {"offices": UAT_OFFICES}
 
     office = office_resolution.resolve_office(candidate, refdata)
 
-    assert office == {"officeId": expected_office_id, "officeName": expected_office_name}
+    assert office == {
+        "officeId": expected_office_id,
+        "officeName": expected_office_name,
+        "hostCountry": expected_host_country,
+    }
 
 
 @pytest.mark.parametrize(
@@ -79,6 +87,82 @@ def test_resolve_office_returns_none_when_translated_name_missing_from_current_r
 def test_resolve_office_returns_none_when_refdata_is_none():
     candidate = {"workplace": "Serbia Live Casino"}
     assert office_resolution.resolve_office(candidate, None) is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_host_country() -- explicit officeName -> hostCountry mapping,
+# confirmed 2026-08-06 by official email from Benivo (full office catalogue).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "office_name, expected_host_country",
+    [
+        ("Serbia (Live Casino)", "Serbia"),
+        ("Serbia (Global)", "Serbia"),
+        ("UAE (Live Casino)", "UAE"),
+        ("UAE (Global)", "UAE"),
+        ("Bulgaria (Live Casino)", "Bulgaria"),
+        ("Malta (Global)", "Malta"),
+        ("Romania (Live Casino)", "Romania"),
+        ("Romania (Global)", "Romania"),
+        ("Colombia (Live Casino)", "Colombia"),
+        ("Canada (Live Casino)", "Canada"),
+        ("Brazil (Live Casino)", "Brazil"),
+        ("Latvia (Global)", "Latvia"),
+        ("Gibraltar (Head office)", "Gibraltar"),
+    ],
+)
+def test_resolve_host_country_covers_full_confirmed_office_catalogue(office_name, expected_host_country):
+    assert office_resolution.resolve_host_country(office_name) == expected_host_country
+
+
+def test_resolve_host_country_covers_every_uat_office_in_test_fixture():
+    # Every officeName in this test file's own UAT_OFFICES fixture (the 13
+    # real offices fetched live) must have a hostCountry -- guards against
+    # the catalogue and the mapping silently drifting apart.
+    for office in UAT_OFFICES:
+        assert office_resolution.resolve_host_country(office["officeName"]) is not None, office["officeName"]
+
+
+def test_resolve_host_country_returns_none_for_unmapped_office_name():
+    assert office_resolution.resolve_host_country("Nonexistent Office (Global)") is None
+
+
+def test_resolve_host_country_returns_none_for_none():
+    assert office_resolution.resolve_host_country(None) is None
+
+
+def test_resolve_office_includes_host_country_for_every_uat_office():
+    # Full round-trip through resolve_office() (not just resolve_host_country
+    # directly) for every workplace this codebase currently routes.
+    for jobvite_workplace, expected_host_country in [
+        ("RAK Live Casino", "UAE"),
+        ("Serbia Live Casino", "Serbia"),
+        ("Colombia Live Casino", "Colombia"),
+        ("Bulgaria Live Casino", "Bulgaria"),
+        ("Malta", "Malta"),
+        ("Romania Live Casino", "Romania"),
+        ("Latvia", "Latvia"),
+    ]:
+        office = office_resolution.resolve_office({"workplace": jobvite_workplace}, {"offices": UAT_OFFICES})
+        assert office["hostCountry"] == expected_host_country
+
+
+def test_resolve_office_never_infers_host_country_from_candidate_address_fields():
+    # hostCountry must come only from the resolved Benivo office, never from
+    # any address/location-shaped field on the candidate -- even when such
+    # fields are present (and wrong), they must be completely ignored.
+    candidate = {
+        "workplace": "Serbia Live Casino",
+        "home_country": "United States",
+        "host_country": "Wrong Country",
+        "host_city": "Wrong City",
+        "country": "USA",
+    }
+
+    office = office_resolution.resolve_office(candidate, {"offices": UAT_OFFICES})
+
+    assert office["hostCountry"] == "Serbia"
 
 
 def test_resolve_office_uses_whatever_uuid_the_current_refdata_provides():

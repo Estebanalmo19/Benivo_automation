@@ -92,14 +92,22 @@ def test_validate_uat_candidate_relocation_not_yes():
     assert result["checks"]["is_relocation_required_is_yes"] is False
 
 
-def test_validate_uat_candidate_missing_start_date():
+def test_validate_uat_candidate_missing_jobvite_start_date_is_now_eligible():
+    # Rule change: a missing Jobvite start_date no longer blocks UAT
+    # eligibility -- resolve_effective_start_date() supplies a calculated
+    # fallback, so this candidate is fully eligible as long as every other
+    # check passes (it does, per _eligible_candidate()'s defaults).
     candidate = _eligible_candidate(start_date=None)
+    execution_timestamp = datetime.datetime(2026, 8, 6, tzinfo=datetime.timezone.utc)
+
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
          patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
-        result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
+        result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES}, execution_timestamp=execution_timestamp)
 
-    assert result["eligible"] is False
-    assert result["checks"]["start_date_present"] is False
+    assert result["eligible"] is True
+    assert result["checks"]["effective_start_date_resolved"] is True
+    assert result["summary"]["start_date_source"] == "CALCULATED"
+    assert result["summary"]["start_date"] == "2026-11-01"  # _format_start_date() on a plain date -> str(date)
 
 
 def test_validate_uat_candidate_not_ready_to_post_status():

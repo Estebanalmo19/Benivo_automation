@@ -9,6 +9,9 @@ from app.services import posting_service as posting
 
 BENIVO_POST = "app.clients.benivo_client.requests.post"
 BENIVO_GET = "app.clients.benivo_client.requests.get"
+BENIVO_PATCH = "app.clients.benivo_client.requests.patch"
+
+EXECUTION_TIMESTAMP = datetime.datetime(2026, 8, 6, tzinfo=datetime.timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +107,7 @@ def test_post_single_candidate_reports_already_exists_without_calling_create():
     }
 
     with patch(BENIVO_POST, return_value=lookup_response) as mock_post:
-        result = posting.post_single_candidate("fake-token", candidate, refdata)
+        result = posting.post_single_candidate("fake-token", candidate, refdata, EXECUTION_TIMESTAMP)
 
     assert result["outcome"] == "already_exists"
     mock_post.assert_called_once()  # only the lookup call, create_user never invoked
@@ -114,7 +117,7 @@ def test_post_single_candidate_fails_when_office_cannot_be_resolved():
     candidate = {"application_eid": "APP-2", "email": "x@example.com", "workplace": "Unknown Office"}
 
     with patch(BENIVO_POST) as mock_post:
-        result = posting.post_single_candidate("fake-token", candidate, refdata={"offices": []})
+        result = posting.post_single_candidate("fake-token", candidate, refdata={"offices": []}, execution_timestamp=EXECUTION_TIMESTAMP)
 
     assert result["outcome"] == "failed"
     mock_post.assert_not_called()  # never even attempts an API call without a resolved office
@@ -124,11 +127,27 @@ def test_unresolved_office_prevents_posting():
     candidate = {"application_eid": "APP-3", "email": "x@example.com", "workplace": "Nonexistent Office"}
 
     with patch(BENIVO_POST) as mock_post:
-        result = posting.post_single_candidate("fake-token", candidate, refdata={"offices": []})
+        result = posting.post_single_candidate("fake-token", candidate, refdata={"offices": []}, execution_timestamp=EXECUTION_TIMESTAMP)
 
     assert result["outcome"] == "failed"
     assert result["benivo_user_id"] is None
     mock_post.assert_not_called()  # never attempts create-user or lookup without a resolved office
+
+
+def test_post_single_candidate_includes_start_date_audit_fields():
+    candidate = {
+        "application_eid": "APP-4",
+        "email": "x@example.com",
+        "workplace": "Unknown Office",
+        "start_date": None,
+    }
+
+    with patch(BENIVO_POST):
+        result = posting.post_single_candidate("fake-token", candidate, refdata={"offices": []}, execution_timestamp=EXECUTION_TIMESTAMP)
+
+    assert result["execution_date"] == EXECUTION_TIMESTAMP
+    assert result["effective_start_date"] == datetime.date(2026, 11, 1)
+    assert result["start_date_source"] == "CALCULATED"
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +202,102 @@ def test_dry_run_preview_includes_policy_name(monkeypatch):
     assert results[0]["payload"]["policy"] == "Tier 1"
 
 
+def test_dry_run_preview_includes_home_country_and_case_update_payload(monkeypatch):
+    # Controlled dry-run validation for the Case API extension: no real
+    # POST/PATCH is ever made in dry run (BENIVO_PATCH not even patched
+    # here -- calling it would blow up the test if it were somehow
+    # invoked), but the preview must already show homeCountry on the
+    # create-user payload and the exact Case PATCH shape that would be
+    # sent (caseId=None, since it's only known after a real create-user).
+    monkeypatch.delenv("BENIVO_ALLOW_REFERENCE_DATA_CALLS", raising=False)
+    candidates = [
+        {
+            "application_eid": "APP-1",
+            "email": "jane@example.com",
+            "first_name": "Jane",
+            "last_name": "Doe",
+            "workplace": "Serbia Live Casino",
+            "start_date": None,
+            "is_vip": False,
+            "job_title": "Game Presenter",
+            "home_country": "Serbia",
+        }
+    ]
+
+    with patch(BENIVO_POST) as mock_post, patch(BENIVO_GET) as mock_get:
+        results = posting.post_candidates(candidates, dry_run=True)
+
+    mock_post.assert_not_called()
+    mock_get.assert_not_called()
+    assert results[0]["payload"]["homeCountry"] == "Serbia"
+    assert results[0]["case_update_payload_preview"] == {
+        "caseId": None,
+        "hostJobRole": "Game Presenter",
+        "homeLocation": {"country": "Serbia"},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Effective start date resolution surfaced through the dry-run preview
+# ---------------------------------------------------------------------------
+
+def test_dry_run_preview_reports_calculated_source_when_jobvite_date_missing(monkeypatch):
+    monkeypatch.delenv("BENIVO_ALLOW_REFERENCE_DATA_CALLS", raising=False)
+    candidates = [{"application_eid": "APP-1", "email": "jane@example.com", "first_name": "Jane", "last_name": "Doe", "workplace": "Serbia Live Casino", "start_date": None, "is_vip": False}]
+
+    with patch(BENIVO_POST) as mock_post, patch(BENIVO_GET) as mock_get:
+        results = posting.post_candidates(candidates, dry_run=True)
+
+    mock_post.assert_not_called()
+    mock_get.assert_not_called()
+    assert results[0]["start_date_source"] == "CALCULATED"
+    assert results[0]["effective_start_date"] is not None
+    assert results[0]["payload"]["startDateOfAssignment"] is not None  # never left blank -- see resolve_effective_start_date()
+
+
+def test_dry_run_preview_reports_jobvite_source_when_start_date_present(monkeypatch):
+    monkeypatch.delenv("BENIVO_ALLOW_REFERENCE_DATA_CALLS", raising=False)
+    candidates = [{"application_eid": "APP-1", "email": "jane@example.com", "first_name": "Jane", "last_name": "Doe", "workplace": "Serbia Live Casino", "start_date": datetime.date(2026, 3, 1), "is_vip": False}]
+
+    with patch(BENIVO_POST) as mock_post, patch(BENIVO_GET) as mock_get:
+        results = posting.post_candidates(candidates, dry_run=True)
+
+    assert results[0]["start_date_source"] == "JOBVITE"
+    assert results[0]["effective_start_date"] == "2026-03-01"
+    assert results[0]["payload"]["startDateOfAssignment"] == "2026-03-01"
+
+
+def test_post_candidates_generates_execution_timestamp_once_per_run(monkeypatch):
+    # Multiple candidates, none with a Jobvite start_date -- every one must
+    # land on the exact same calculated date because post_candidates()
+    # generates execution_timestamp exactly once for the whole run.
+    #
+    # A real datetime subclass (not a plain MagicMock) is used here so
+    # posting_service._format_start_date()'s isinstance(x, datetime) check
+    # keeps working correctly while datetime.now() is frozen.
+    monkeypatch.delenv("BENIVO_ALLOW_REFERENCE_DATA_CALLS", raising=False)
+    candidates = [
+        {"application_eid": f"APP-{i}", "email": f"a{i}@example.com", "first_name": "A", "last_name": "B", "workplace": "Serbia Live Casino", "start_date": None, "is_vip": False}
+        for i in range(4)
+    ]
+
+    call_count = {"n": 0}
+    fixed_now = datetime.datetime(2026, 8, 6, tzinfo=datetime.timezone.utc)
+
+    class FrozenDatetime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            call_count["n"] += 1
+            return fixed_now
+
+    with patch(BENIVO_POST), patch(BENIVO_GET), patch("app.services.posting_service.datetime", FrozenDatetime):
+        results = posting.post_candidates(candidates, dry_run=True)
+
+    assert call_count["n"] == 1
+    assert {r["effective_start_date"] for r in results} == {"2026-11-01"}
+    assert {r["start_date_source"] for r in results} == {"CALCULATED"}
+
+
 # ---------------------------------------------------------------------------
 # build_benivo_payload() -- policy_api_value, never the business label
 # ---------------------------------------------------------------------------
@@ -194,7 +309,7 @@ def test_build_benivo_payload_sends_policy_api_value_not_business_label():
     candidate_basic = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False, "start_date": None}
     office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
 
-    assert posting.build_benivo_payload(candidate_basic, office)["policy"] == "Tier 1"
+    assert posting.build_benivo_payload(candidate_basic, office, datetime.date(2026, 1, 1))["policy"] == "Tier 1"
 
 
 def test_build_benivo_payload_vip_has_no_confirmed_api_value_so_policy_is_none():
@@ -203,9 +318,242 @@ def test_build_benivo_payload_vip_has_no_confirmed_api_value_so_policy_is_none()
     candidate_vip = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": True, "start_date": None}
     office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
 
-    payload = posting.build_benivo_payload(candidate_vip, office)
+    payload = posting.build_benivo_payload(candidate_vip, office, datetime.date(2026, 1, 1))
     assert payload["policy"] is None
     assert posting._validate_payload(payload) is False
+
+
+def test_build_benivo_payload_sends_effective_start_date_not_raw_candidate_start_date():
+    # build_benivo_payload() is a pure formatter: it must use the
+    # already-resolved effective_start_date it's given, never re-derive it
+    # from candidate["start_date"] (which may be None here even though a
+    # calculated date was already resolved upstream).
+    candidate = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False, "start_date": None}
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 11, 1))
+
+    assert payload["startDateOfAssignment"] == "2026-11-01"
+
+
+def test_build_benivo_payload_never_includes_job_title():
+    # Job Title investigation (completed): no confirmed Benivo API field
+    # name exists in create-user, so it must never be sent there (it goes
+    # to the Case PATCH's hostJobRole instead -- see build_case_update_payload).
+    candidate = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False, "job_title": "Business Intelligence (BI) Specialist"}
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    assert "jobTitle" not in payload
+    assert "job_title" not in payload
+
+
+def test_build_benivo_payload_includes_home_country():
+    # Confirmed 2026-08-10 by Gina (Benivo): create-user must populate
+    # homeCountry from candidates.home_country.
+    candidate = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False, "home_country": "Serbia"}
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    assert payload["homeCountry"] == "Serbia"
+
+
+def test_build_benivo_payload_home_country_none_when_missing():
+    candidate = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False}
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    assert payload["homeCountry"] is None
+
+
+def test_build_benivo_payload_falls_back_to_current_country():
+    # Confirmed 2026-08-10 during the Country Data Issues investigation:
+    # candidate_home_country has real gaps that Jobvite's own
+    # current-location country field (current_country) reliably fills.
+    candidate = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False, "home_country": None, "current_country": "Belarus"}
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    assert payload["homeCountry"] == "Belarus"
+
+
+def test_build_benivo_payload_prefers_home_country_over_current_country():
+    candidate = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False, "home_country": "Georgia", "current_country": "Serbia"}
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    assert payload["homeCountry"] == "Georgia"
+
+
+# ---------------------------------------------------------------------------
+# build_case_update_payload() -- only the confirmed Case PATCH fields
+# ---------------------------------------------------------------------------
+
+def test_build_case_update_payload_sends_only_confirmed_fields():
+    candidate = {"job_title": "Game Presenter", "home_country": "Serbia"}
+
+    payload = posting.build_case_update_payload(candidate, case_id=1010644)
+
+    assert payload == {
+        "caseId": 1010644,
+        "hostJobRole": "Game Presenter",
+        "homeLocation": {"country": "Serbia"},
+    }
+
+
+def test_build_case_update_payload_handles_missing_fields():
+    payload = posting.build_case_update_payload({}, case_id=None)
+
+    assert payload == {
+        "caseId": None,
+        "hostJobRole": None,
+        "homeLocation": {"country": None},
+    }
+
+
+def test_build_case_update_payload_falls_back_to_current_country():
+    candidate = {"job_title": "Game Presenter", "home_country": None, "current_country": "United Arab Emirates"}
+
+    payload = posting.build_case_update_payload(candidate, case_id=1010644)
+
+    assert payload["homeLocation"]["country"] == "United Arab Emirates"
+
+
+def test_build_case_update_payload_agrees_with_create_user_payload_on_home_country():
+    # Both payloads must resolve the same candidate's home country
+    # identically -- see build_case_update_payload()'s docstring.
+    candidate = {
+        "first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False,
+        "job_title": "Game Presenter", "home_country": None, "current_country": "Belarus",
+    }
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    create_payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+    case_payload = posting.build_case_update_payload(candidate, case_id=1)
+
+    assert create_payload["homeCountry"] == case_payload["homeLocation"]["country"] == "Belarus"
+
+
+# ---------------------------------------------------------------------------
+# post_single_candidate() -- Case PATCH follow-up after a successful create-user
+# ---------------------------------------------------------------------------
+
+def _lookup_not_found_response():
+    response = MagicMock(status_code=200, content=b"{}")
+    response.json.return_value = {"hasError": False, "data": {"user": None, "assignments": []}}
+    return response
+
+
+def _create_response(benivo_id=605070, assignment_id=1010644, email="jane@example.com"):
+    response = MagicMock(status_code=200, content=b"{}")
+    response.json.return_value = {
+        "hasError": False,
+        "data": [{"benivoId": benivo_id, "assignmentId": assignment_id, "email": email}],
+    }
+    return response
+
+
+def test_post_single_candidate_calls_case_patch_after_successful_create_user():
+    case_response = MagicMock(status_code=200, content=b"{}")
+    case_response.json.return_value = {"hasError": False}
+
+    refdata = {"offices": [{"id": "office-1", "officeName": "Colombia (Live Casino)"}]}
+    candidate = {
+        "application_eid": "APP-1",
+        "email": "jane@example.com",
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "workplace": "Colombia Live Casino",
+        "start_date": datetime.date(2026, 1, 1),
+        "is_vip": False,
+        "job_title": "Game Presenter",
+        "home_country": "Serbia",
+    }
+
+    with patch(BENIVO_POST, side_effect=[_lookup_not_found_response(), _create_response()]), \
+         patch(BENIVO_PATCH, return_value=case_response) as mock_patch:
+        result = posting.post_single_candidate("fake-token", candidate, refdata, EXECUTION_TIMESTAMP)
+
+    assert result["outcome"] == "success"
+    assert result["case_update"]["success"] is True
+    assert result["case_update"]["case_id"] == 1010644
+    assert result["case_update"]["request_payload"] == {
+        "caseId": 1010644,
+        "hostJobRole": "Game Presenter",
+        "homeLocation": {"country": "Serbia"},
+    }
+    mock_patch.assert_called_once()
+
+
+def test_post_single_candidate_case_patch_failure_does_not_change_outcome():
+    case_response = MagicMock(status_code=500, content=b"{}")
+    case_response.json.return_value = {"message": "server error"}
+
+    refdata = {"offices": [{"id": "office-1", "officeName": "Colombia (Live Casino)"}]}
+    candidate = {
+        "application_eid": "APP-1",
+        "email": "jane@example.com",
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "workplace": "Colombia Live Casino",
+        "start_date": datetime.date(2026, 1, 1),
+        "is_vip": False,
+        "job_title": "Game Presenter",
+        "home_country": "Serbia",
+    }
+
+    with patch(BENIVO_POST, side_effect=[_lookup_not_found_response(), _create_response()]), \
+         patch(BENIVO_PATCH, return_value=case_response):
+        result = posting.post_single_candidate("fake-token", candidate, refdata, EXECUTION_TIMESTAMP)
+
+    # create-user already succeeded -- a Case PATCH failure must never
+    # change the create-user outcome (candidate remains POSTED downstream).
+    assert result["outcome"] == "success"
+    assert result["benivo_user_id"] == 605070
+    assert result["case_update"]["success"] is False
+    assert result["case_update"]["error_message"] is not None
+
+
+def test_case_patch_not_attempted_when_user_already_exists():
+    lookup_response = MagicMock(status_code=200, content=b"{}")
+    lookup_response.json.return_value = {
+        "hasError": False,
+        "data": {"user": {"email": "jane@example.com", "benivoId": 1}, "assignments": [{"assignmentId": 99}]},
+    }
+
+    refdata = {"offices": [{"id": "office-1", "officeName": "Colombia (Live Casino)"}]}
+    candidate = {
+        "application_eid": "APP-1",
+        "email": "jane@example.com",
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "workplace": "Colombia Live Casino",
+        "start_date": datetime.date(2026, 1, 1),
+        "is_vip": False,
+    }
+
+    with patch(BENIVO_POST, return_value=lookup_response), patch(BENIVO_PATCH) as mock_patch:
+        result = posting.post_single_candidate("fake-token", candidate, refdata, EXECUTION_TIMESTAMP)
+
+    assert result["outcome"] == "already_exists"
+    assert "case_update" not in result
+    mock_patch.assert_not_called()
+
+
+def test_case_patch_not_attempted_when_office_unresolved():
+    candidate = {"application_eid": "APP-2", "email": "x@example.com", "workplace": "Unknown Office"}
+
+    with patch(BENIVO_POST), patch(BENIVO_PATCH) as mock_patch:
+        result = posting.post_single_candidate("fake-token", candidate, refdata={"offices": []}, execution_timestamp=EXECUTION_TIMESTAMP)
+
+    assert result["outcome"] == "failed"
+    assert "case_update" not in result
+    mock_patch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +607,50 @@ def test_build_post_log_insert_vip_candidate():
     assert row["policy_api_value"] is None  # unconfirmed for VIP -- must never be guessed
 
 
+def test_build_post_log_insert_includes_start_date_audit_fields():
+    candidate = {"application_eid": "APP-1", "candidate_eid": "CAND-1", "email": "jane@example.com", "is_vip": False}
+    result = {
+        "outcome": "success",
+        "request_payload": {"firstName": "Jane"},
+        "response_payload": {"data": [{"benivoId": 1}]},
+        "error_message": None,
+        "benivo_user_id": 1,
+        "benivo_assignment_id": 2,
+        "benivo_profile_url": None,
+        "execution_date": EXECUTION_TIMESTAMP,
+        "effective_start_date": datetime.date(2026, 11, 1),
+        "start_date_source": "CALCULATED",
+    }
+
+    row = posting.build_post_log_insert("run-123", candidate, result)
+
+    assert row["execution_date"] == EXECUTION_TIMESTAMP
+    assert row["effective_start_date"] == datetime.date(2026, 11, 1)
+    assert row["start_date_source"] == "CALCULATED"
+
+
+def test_build_post_log_insert_defaults_start_date_audit_fields_to_none_when_absent():
+    # Backward compatibility: a result dict built before this rule existed
+    # (no execution_date/effective_start_date/start_date_source keys) must
+    # not raise -- it just records NULL for the three new audit columns.
+    candidate = {"application_eid": "APP-1", "candidate_eid": "CAND-1", "email": "jane@example.com", "is_vip": False}
+    result = {
+        "outcome": "success",
+        "request_payload": {"firstName": "Jane"},
+        "response_payload": {"data": [{"benivoId": 1}]},
+        "error_message": None,
+        "benivo_user_id": 1,
+        "benivo_assignment_id": 2,
+        "benivo_profile_url": None,
+    }
+
+    row = posting.build_post_log_insert("run-123", candidate, result)
+
+    assert row["execution_date"] is None
+    assert row["effective_start_date"] is None
+    assert row["start_date_source"] is None
+
+
 def test_build_post_log_insert_failed_outcome_maps_to_failed_status():
     candidate = {"application_eid": "APP-2", "candidate_eid": None, "email": None}
     result = {
@@ -275,6 +667,49 @@ def test_build_post_log_insert_failed_outcome_maps_to_failed_status():
 
     assert row["status"] == "FAILED"
     assert row["error_message"] == "office not resolved"
+
+
+# ---------------------------------------------------------------------------
+# build_case_update_post_log_insert() -- separate UPDATE_CASE audit row
+# ---------------------------------------------------------------------------
+
+def test_build_case_update_post_log_insert_success():
+    candidate = {"application_eid": "APP-1", "candidate_eid": "CAND-1", "email": "jane@example.com", "is_vip": False}
+    case_update = {
+        "attempted": True,
+        "success": True,
+        "case_id": 1010644,
+        "request_payload": {"caseId": 1010644, "hostJobRole": "Engineer", "homeLocation": {"country": "Serbia"}},
+        "response_payload": {"hasError": False},
+        "error_message": None,
+    }
+
+    row = posting.build_case_update_post_log_insert("run-123", candidate, case_update)
+
+    assert row["action"] == "UPDATE_CASE"
+    assert row["status"] == "SUCCESS"
+    assert row["benivo_assignment_id"] == 1010644
+    assert row["request_payload"]["hostJobRole"] == "Engineer"
+    assert row["policy_name"] is None  # no policy decision applies to a Case update
+    assert row["policy_api_value"] is None
+
+
+def test_build_case_update_post_log_insert_failure():
+    candidate = {"application_eid": "APP-1", "candidate_eid": "CAND-1", "email": "jane@example.com", "is_vip": False}
+    case_update = {
+        "attempted": True,
+        "success": False,
+        "case_id": 1010644,
+        "request_payload": {"caseId": 1010644},
+        "response_payload": {"hasError": True},
+        "error_message": "boom",
+    }
+
+    row = posting.build_case_update_post_log_insert("run-123", candidate, case_update)
+
+    assert row["action"] == "UPDATE_CASE"
+    assert row["status"] == "FAILED"
+    assert row["error_message"] == "boom"
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +761,87 @@ def test_record_post_result_uses_one_transaction_for_both_writes():
     assert "UPDATE benivo.candidates" in update_sql
     assert update_params[0] == "POSTED"
     assert update_params[-1] == "APP-1"
+
+
+def test_record_post_result_writes_case_update_row_when_present():
+    # Case PATCH failed, but create-user succeeded -- three statements in
+    # one transaction: CREATE_USER insert, UPDATE_CASE insert, candidate
+    # UPDATE. Candidate status must still be driven by the CREATE_USER
+    # outcome only, unaffected by the failed Case PATCH.
+    mock_cursor = MagicMock()
+
+    class FakeTransaction:
+        def __enter__(self):
+            return mock_cursor
+
+        def __exit__(self, *args):
+            return False
+
+    candidate = {"application_eid": "APP-1", "candidate_eid": "CAND-1", "email": "jane@example.com"}
+    result = {
+        "outcome": "success",
+        "request_payload": {"firstName": "Jane"},
+        "response_payload": {"ok": True},
+        "error_message": None,
+        "benivo_user_id": 1,
+        "benivo_assignment_id": 2,
+        "benivo_profile_url": None,
+        "case_update": {
+            "attempted": True,
+            "success": False,
+            "case_id": 2,
+            "request_payload": {"caseId": 2, "hostJobRole": None, "homeLocation": {"country": None}},
+            "response_payload": {"hasError": True},
+            "error_message": "boom",
+        },
+    }
+
+    with patch("app.services.posting_service.transaction", return_value=FakeTransaction()) as mock_transaction:
+        posting.record_post_result(candidate, result, run_id="run-123")
+
+    mock_transaction.assert_called_once()  # exactly one transaction for all three statements
+    assert mock_cursor.execute.call_count == 3
+
+    case_insert_sql, case_insert_params = mock_cursor.execute.call_args_list[1][0]
+    assert "INSERT INTO benivo.post_log" in case_insert_sql
+    assert case_insert_params[0] == "run-123"  # run_id
+    assert case_insert_params[1] == "APP-1"  # application_eid
+    assert case_insert_params[4] == "UPDATE_CASE"  # action
+    assert case_insert_params[5] == "FAILED"  # status
+
+    update_sql, update_params = mock_cursor.execute.call_args_list[2][0]
+    assert "UPDATE benivo.candidates" in update_sql
+    assert update_params[0] == "POSTED"  # driven by CREATE_USER outcome, not the failed case_update
+
+
+def test_record_post_result_skips_case_update_row_when_absent():
+    # Backward compatible: a result dict without "case_update" (already_exists/
+    # failed outcomes, or results built before this rule existed) writes
+    # exactly the original two statements.
+    mock_cursor = MagicMock()
+
+    class FakeTransaction:
+        def __enter__(self):
+            return mock_cursor
+
+        def __exit__(self, *args):
+            return False
+
+    candidate = {"application_eid": "APP-1", "candidate_eid": "CAND-1", "email": "jane@example.com"}
+    result = {
+        "outcome": "already_exists",
+        "request_payload": {"firstName": "Jane"},
+        "response_payload": {"ok": True},
+        "error_message": None,
+        "benivo_user_id": 1,
+        "benivo_assignment_id": 2,
+        "benivo_profile_url": None,
+    }
+
+    with patch("app.services.posting_service.transaction", return_value=FakeTransaction()):
+        posting.record_post_result(candidate, result, run_id="run-123")
+
+    assert mock_cursor.execute.call_count == 2
 
 
 def test_record_post_result_rolls_back_and_reraises_on_db_error():
