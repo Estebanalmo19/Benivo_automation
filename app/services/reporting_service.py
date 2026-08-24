@@ -10,12 +10,13 @@ should query Postgres directly, not diff old Excel files.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app import config
@@ -38,6 +39,107 @@ logger = logging.getLogger(__name__)
 REPORT_FILENAME_PREFIX = "benivo_operational_report"
 
 MOBILITY_WORKFLOW_STATE = "Mobility in process"
+
+# Go-live categories -- report-only labels computed on demand by
+# _go_live_category(), never stored anywhere (benivo_status is completely
+# independent of go-live timing; see docs/PHASE1_ARCHITECTURE.md's Go-Live
+# section and candidate_repository.get_ready_candidates()).
+GO_LIVE_ALREADY_POSTED = "Already Posted"
+GO_LIVE_PRE_GO_LIVE_BACKLOG = "Pre-Go-Live Backlog"
+GO_LIVE_AUTOMATICALLY_ELIGIBLE = "Automatically Eligible"
+GO_LIVE_NEWLY_ELIGIBLE = "Newly Eligible"
+
+# --- Arrise visual language -----------------------------------------------
+# Presentation only -- these constants and every helper below them touch
+# ONLY how the workbook looks (fills, fonts, borders, layout). No function
+# in this section computes, filters, or selects data.
+COLOR_PRIMARY = "35106A"
+COLOR_PRIMARY_DARK = "2A0C55"
+COLOR_PRIMARY_SOFT = "F4EEFC"
+COLOR_INK = "1C0F38"
+COLOR_BG = "F7F5FB"
+COLOR_SURFACE = "FFFFFF"
+COLOR_BORDER = "E5E1EE"
+COLOR_TEXT_PRIMARY = "1A1424"
+COLOR_TEXT_SECONDARY = "6B6475"
+COLOR_SUCCESS = "1F9D55"
+COLOR_SUCCESS_BG = "E8F7EE"
+COLOR_WARNING = "B7791F"
+COLOR_WARNING_BG = "FDF3DD"
+COLOR_ERROR = "C0392B"
+COLOR_ERROR_BG = "FBEAE8"
+COLOR_INFO = "2F6FD6"
+COLOR_INFO_BG = "E8F0FD"
+
+_SEMANTIC_FILLS = {
+    "success": (COLOR_SUCCESS_BG, COLOR_SUCCESS),
+    "warning": (COLOR_WARNING_BG, COLOR_WARNING),
+    "error": (COLOR_ERROR_BG, COLOR_ERROR),
+    "info": (COLOR_INFO_BG, COLOR_INFO),
+}
+
+# Column-agnostic: these exact string VALUES mean the same thing regardless
+# of which sheet/column they appear in (benivo_status, action status,
+# go_live_category, start_date_source, country source, ...), so one table
+# covers every sheet instead of a per-column special case each.
+_SEMANTIC_STRING_VALUES = {
+    "POSTED": "success",
+    "SUCCESS": "success",
+    GO_LIVE_AUTOMATICALLY_ELIGIBLE: "success",
+    GO_LIVE_ALREADY_POSTED: "success",
+    "ALREADY_EXISTS": "info",
+    "CALCULATED": "info",
+    "CURRENT_LOCATION": "info",
+    GO_LIVE_NEWLY_ELIGIBLE: "info",
+    "PENDING_OFFICE_MAPPING": "warning",
+    "NEEDS_RECRUITER_REVIEW": "warning",
+    "PENDING_MISSING_START_DATE": "warning",
+    "PENDING": "warning",
+    GO_LIVE_PRE_GO_LIVE_BACKLOG: "warning",
+    "MISSING": "warning",
+    "FAILED": "error",
+    "POST_FAILED": "error",
+}
+
+# Boolean columns where the semantic meaning of True/False depends on the
+# column itself (e.g. payload_ready=True is good, missing_job_title=True is
+# a problem) -- handled separately from the value table above.
+_POSITIVE_BOOL_COLUMNS = {"Payload Ready", "payload_ready", "ready_to_create_user", "ready_to_update_case"}
+_NEGATIVE_BOOL_COLUMNS = {
+    "missing_home_country",
+    "missing_job_title",
+    "missing_effective_start_date",
+    "unresolved_office",
+    "invalid_policy",
+}
+
+# Columns whose values are free text and should wrap + left-align instead
+# of being centered -- matched by substring so every current and future
+# name/email/title/reason-shaped column is covered without an exhaustive list.
+_WRAP_HINTS = ("reason", "email", "name", "title", "workplace", "location", "note", "message", "role")
+
+_KEY_KPI_LABELS = {
+    "Total Candidates",
+    "Ready To Post",
+    "Successfully Posted",
+    "Failed",
+    GO_LIVE_AUTOMATICALLY_ELIGIBLE,
+    "Tier 2",
+}
+
+_THIN_SIDE = Side(style="thin", color=COLOR_BORDER)
+_THIN_BORDER = Border(left=_THIN_SIDE, right=_THIN_SIDE, top=_THIN_SIDE, bottom=_THIN_SIDE)
+
+GO_LIVE_STATUS_COLUMNS = [
+    "application_eid",
+    "candidate_name",
+    "workflow_state",
+    "benivo_status",
+    "first_seen_in_scope_at",
+    "go_live_category",
+    "job_title",
+    "workplace",
+]
 
 # Used by _build_row() -- Pending Office Mapping and Pending Recruiter
 # Review share this shape. Country Data Issues has its own dedicated shape
@@ -83,6 +185,8 @@ READY_TO_POST_COLUMNS = [
     "Job Title",
     "Policy",
     "VIP",
+    "Mobility VIP",
+    "Policy (Tier)",
     "Original Start Date",
     "Effective Start Date",
     "Start Date Source",
@@ -124,6 +228,7 @@ PAYLOAD_PREVIEW_COLUMNS = [
     "resolved_office_id",
     "resolved_host_country",
     "is_vip",
+    "mobility_vip",
     "policy_name",
     "policy_api_value",
     # Create User payload preview (== posting_service.build_benivo_payload())
@@ -138,7 +243,8 @@ PAYLOAD_PREVIEW_COLUMNS = [
     # Case PATCH payload preview (== posting_service.build_case_update_payload())
     "case_caseId_available",
     "case_hostJobRole",
-    "case_homeLocation_country",
+    "case_home_country",
+    "case_home_country_iso",
     # Posting state
     "benivo_status",
     "has_terminal_create_user_result",
@@ -323,6 +429,60 @@ def _build_country_data_issue_row(candidate: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _go_live_category(
+    benivo_status: Optional[str],
+    first_seen_in_scope_at: Optional[datetime],
+    go_live_at: Optional[datetime],
+) -> str:
+    """
+    Mutually exclusive go-live classification, entirely independent of
+    benivo_status -- a report-only label, never written back to the
+    database. Priority order:
+      1. Already Posted: benivo_status == POSTED, regardless of timing --
+         once posted, go-live timing no longer matters operationally.
+      2. Pre-Go-Live Backlog: go_live_at isn't configured yet, OR this
+         application_eid has no benivo.scope_history row at all, OR its
+         first_seen_in_scope_at is before go_live_at. The "no row at all"
+         case is a conservative default -- see
+         candidate_repository.get_ready_candidates(), which applies the
+         exact same "no proof it's new -> treat as backlog" rule so this
+         report and actual posting behavior can never disagree.
+      3. Automatically Eligible: first seen on/after go_live_at AND
+         currently READY_TO_POST -- exactly the population
+         get_ready_candidates() will actually pick up on the next run.
+      4. Newly Eligible: first seen on/after go_live_at but not yet
+         READY_TO_POST (still missing something -- office mapping, start
+         date, relocation confirmation).
+    """
+    if benivo_status == "POSTED":
+        return GO_LIVE_ALREADY_POSTED
+
+    if go_live_at is None or first_seen_in_scope_at is None or first_seen_in_scope_at < go_live_at:
+        return GO_LIVE_PRE_GO_LIVE_BACKLOG
+
+    if benivo_status == "READY_TO_POST":
+        return GO_LIVE_AUTOMATICALLY_ELIGIBLE
+
+    return GO_LIVE_NEWLY_ELIGIBLE
+
+
+def _build_go_live_status_row(
+    candidate: Dict[str, Any],
+    first_seen_in_scope_at: Optional[datetime],
+    go_live_at: Optional[datetime],
+) -> Dict[str, Any]:
+    return {
+        "application_eid": candidate.get("application_eid"),
+        "candidate_name": _candidate_name(candidate),
+        "workflow_state": candidate.get("workflow_state"),
+        "benivo_status": candidate.get("benivo_status"),
+        "first_seen_in_scope_at": _excel_safe(first_seen_in_scope_at),
+        "go_live_category": _go_live_category(candidate.get("benivo_status"), first_seen_in_scope_at, go_live_at),
+        "job_title": candidate.get("job_title"),
+        "workplace": candidate.get("workplace"),
+    }
+
+
 def _build_ready_to_post_row(
     candidate: Dict[str, Any],
     office: Optional[Dict[str, str]],
@@ -336,7 +496,7 @@ def _build_ready_to_post_row(
     given candidate is actually ready.
     """
     effective_start_date, start_date_source = resolve_effective_start_date(candidate.get("start_date"), execution_timestamp)
-    policy_name, _policy_api_value = resolve_policy_values(candidate.get("is_vip"))
+    policy_name, policy_api_value = resolve_policy_values(candidate.get("is_vip"))
     effective_home_country, home_country_source = resolve_effective_home_country(candidate)
 
     return {
@@ -354,6 +514,15 @@ def _build_ready_to_post_row(
         "Job Title": candidate.get("job_title"),
         "Policy": policy_name,
         "VIP": candidate.get("is_vip"),
+        # mobility_vip source field is synced directly into is_vip (see
+        # synchronization_service.py) -- "Yes"/"No" here is exactly that
+        # boolean formatted back to the raw Jobvite label, not a separate
+        # stored value, so it can never drift from what is_vip holds.
+        "Mobility VIP": "Yes" if candidate.get("is_vip") else "No",
+        # The literal Benivo API value that will actually be sent -- see
+        # policy_service.POLICY_NAME_TO_API_VALUE, the one centralized
+        # mapping this and every other consumer reads.
+        "Policy (Tier)": policy_api_value,
         "Original Start Date": _excel_safe(candidate.get("start_date")),
         "Effective Start Date": _excel_safe(effective_start_date),
         "Start Date Source": start_date_source,
@@ -385,10 +554,16 @@ def _build_payload_preview_row(
     # PENDING_CREATE_USER rather than left as a bare NULL.
     case_id = candidate.get("benivo_assignment_id")
     case_payload = posting_service.build_case_update_payload(candidate, case_id)
-    case_home_country = (case_payload.get("homeLocation") or {}).get("country")
+    case_data = case_payload.get("data") or {}
+    case_home_country_iso = (case_data.get("homeLocation") or {}).get("country")
 
     policy_name, policy_api_value = resolve_policy_values(candidate.get("is_vip"))
-    _effective_home_country, home_country_source = resolve_effective_home_country(candidate)
+    # Same resolution build_case_update_payload() feeds into
+    # country_code_service.resolve_iso2() -- shown here separately (pre-ISO
+    # conversion) so ops can see the plain country name alongside the ISO
+    # code actually sent, and tell "no country resolved at all" apart from
+    # "country resolved but has no confirmed ISO mapping yet".
+    effective_home_country, home_country_source = resolve_effective_home_country(candidate)
 
     unresolved_office = office is None
     invalid_policy = policy_api_value is None
@@ -397,9 +572,9 @@ def _build_payload_preview_row(
     ready_to_create_user = not missing_create_fields
 
     missing_case_fields = []
-    if not case_payload.get("hostJobRole"):
+    if not case_data.get("hostJobRole"):
         missing_case_fields.append("hostJobRole")
-    if not case_home_country:
+    if not case_home_country_iso:
         missing_case_fields.append("homeLocation.country")
     ready_to_update_case = not missing_case_fields
 
@@ -437,6 +612,7 @@ def _build_payload_preview_row(
         "resolved_office_id": office.get("officeId") if office else None,
         "resolved_host_country": office.get("hostCountry") if office else None,
         "is_vip": candidate.get("is_vip"),
+        "mobility_vip": "Yes" if candidate.get("is_vip") else "No",
         "policy_name": policy_name,
         "policy_api_value": policy_api_value,
         "create_firstName": create_payload.get("firstName"),
@@ -448,8 +624,9 @@ def _build_payload_preview_row(
         "create_officeName": create_payload.get("officeName"),
         "create_startDateOfAssignment": create_payload.get("startDateOfAssignment"),
         "case_caseId_available": case_id if case_id is not None else CASE_ID_PENDING_LABEL,
-        "case_hostJobRole": case_payload.get("hostJobRole"),
-        "case_homeLocation_country": case_home_country,
+        "case_hostJobRole": case_data.get("hostJobRole"),
+        "case_home_country": effective_home_country,
+        "case_home_country_iso": case_home_country_iso,
         "benivo_status": candidate.get("benivo_status"),
         "has_terminal_create_user_result": candidate.get("application_eid") in terminal_eids,
         "selected_for_current_run": "Yes" if selected else "No",
@@ -499,48 +676,283 @@ def _build_posting_results_row(
     }
 
 
+def _is_wrap_column(column_name: str) -> bool:
+    lowered = str(column_name).lower()
+    return any(hint in lowered for hint in _WRAP_HINTS)
+
+
+def _semantic_class(column_name: str, value: Any) -> Optional[str]:
+    """Value/column -> 'success'/'warning'/'error'/'info'/None. Presentation only -- never changes what's stored."""
+    if isinstance(value, bool):
+        if column_name in _POSITIVE_BOOL_COLUMNS:
+            return "success" if value else "warning"
+        if column_name in _NEGATIVE_BOOL_COLUMNS:
+            return "warning" if value else None
+        return None
+
+    if isinstance(value, str):
+        return _SEMANTIC_STRING_VALUES.get(value)
+
+    return None
+
+
+def _write_banner(ws: Worksheet, banner_text: str, num_columns: int) -> None:
+    """Compact one-row title banner: report name, run timestamp, run mode -- consistent across every sheet."""
+    ws.append([banner_text])
+    row_idx = ws.max_row
+    last_col = get_column_letter(max(num_columns, 1))
+
+    if num_columns > 1:
+        ws.merge_cells(f"A{row_idx}:{last_col}{row_idx}")
+
+    cell = ws.cell(row=row_idx, column=1)
+    cell.font = Font(bold=True, color="FFFFFF", size=12)
+    cell.fill = PatternFill("solid", fgColor=COLOR_PRIMARY)
+    cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[row_idx].height = 22
+
+
+def _style_header_row(ws: Worksheet, row_idx: int, num_columns: int) -> None:
+    for col in range(1, num_columns + 1):
+        cell = ws.cell(row=row_idx, column=col)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=COLOR_PRIMARY)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = _THIN_BORDER
+    ws.row_dimensions[row_idx].height = 32
+
+
+def _style_data_rows(ws: Worksheet, columns: List[str], first_data_row: int, last_row: int) -> None:
+    for r in range(first_data_row, last_row + 1):
+        banded = (r - first_data_row) % 2 == 1
+
+        for col_idx, column_name in enumerate(columns, start=1):
+            cell = ws.cell(row=r, column=col_idx)
+            cell.border = _THIN_BORDER
+
+            if isinstance(cell.value, datetime):
+                cell.number_format = "yyyy-mm-dd hh:mm"
+            elif isinstance(cell.value, date):
+                cell.number_format = "yyyy-mm-dd"
+
+            wrap = _is_wrap_column(column_name)
+            cell.alignment = Alignment(
+                horizontal="left" if wrap else "center",
+                vertical="center",
+                wrap_text=wrap,
+            )
+
+            semantic = _semantic_class(column_name, cell.value)
+
+            if semantic:
+                bg, fg = _SEMANTIC_FILLS[semantic]
+                cell.fill = PatternFill("solid", fgColor=bg)
+                cell.font = Font(color=fg)
+            else:
+                cell.fill = PatternFill("solid", fgColor=COLOR_BG if banded else COLOR_SURFACE)
+                cell.font = Font(color=COLOR_TEXT_PRIMARY)
+
+
+def _autosize_columns(ws: Worksheet, columns: List[str]) -> None:
+    for idx, column_name in enumerate(columns, start=1):
+        column_letter = get_column_letter(idx)
+        cells = ws[column_letter]
+        max_length = max((len(str(c.value)) if c.value is not None else 0) for c in cells)
+        cap = 42 if _is_wrap_column(column_name) else 60
+        ws.column_dimensions[column_letter].width = max(min(max_length + 2, cap), 10)
+
+
+def _apply_print_setup(ws: Worksheet, header_row_idx: int) -> None:
+    ws.sheet_view.showGridLines = False
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = f"{header_row_idx}:{header_row_idx}"
+
+
 def _write_table_sheet(
     ws: Worksheet,
     rows: List[Dict[str, Any]],
     empty_note: Optional[str] = None,
     columns: Optional[List[str]] = None,
+    banner_text: Optional[str] = None,
 ) -> None:
     columns = columns or REQUIRED_COLUMNS
 
+    if banner_text:
+        _write_banner(ws, banner_text, len(columns))
+
     if not rows and empty_note:
         ws.append([empty_note])
+        note_cell = ws.cell(row=ws.max_row, column=1)
+        note_cell.font = Font(italic=True, color=COLOR_TEXT_SECONDARY)
         return
 
     ws.append(columns)
+    header_row_idx = ws.max_row
+    _style_header_row(ws, header_row_idx, len(columns))
+    first_data_row = header_row_idx + 1
 
     for row in rows:
         ws.append([row.get(column) for column in columns])
 
-    for column_cells in ws.columns:
-        column_letter = column_cells[0].column_letter
-        max_length = max((len(str(cell.value)) if cell.value is not None else 0) for cell in column_cells)
-        ws.column_dimensions[column_letter].width = min(max_length + 2, 60)
+    last_row = ws.max_row
+
+    if last_row >= first_data_row:
+        _style_data_rows(ws, columns, first_data_row, last_row)
+        ws.auto_filter.ref = f"A{header_row_idx}:{get_column_letter(len(columns))}{last_row}"
+
+    ws.freeze_panes = f"B{first_data_row}"
+    _autosize_columns(ws, columns)
+    _apply_print_setup(ws, header_row_idx)
 
 
-def _write_summary_sheet(ws: Worksheet, rows: List[Any]) -> None:
+def _write_summary_sheet(ws: Worksheet, rows: List[Any], banner_text: Optional[str] = None) -> None:
     """
     rows: ordered (label, value) pairs. A pair whose value is SECTION_HEADER
-    renders as a bold section divider (blank spacer row + bold label row)
-    instead of a metric/value row.
+    renders as a bold section divider (blank spacer row + purple-filled
+    label row) instead of a metric/value row.
     """
+    if banner_text:
+        _write_banner(ws, banner_text, 2)
+
     ws.append(["Metric", "Value"])
+    header_row_idx = ws.max_row
+    _style_header_row(ws, header_row_idx, 2)
 
     for label, value in rows:
         if value is SECTION_HEADER:
             ws.append([])
             ws.append([label])
-            ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+            section_row = ws.max_row
+            ws.merge_cells(f"A{section_row}:B{section_row}")
+            cell = ws.cell(row=section_row, column=1)
+            cell.font = Font(bold=True, color="FFFFFF", size=11)
+            cell.fill = PatternFill("solid", fgColor=COLOR_PRIMARY_DARK)
+            cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+            ws.row_dimensions[section_row].height = 20
             continue
 
         ws.append([label, value])
+        row_idx = ws.max_row
+        banded = row_idx % 2 == 0
+        fill_color = COLOR_BG if banded else COLOR_SURFACE
+        is_key_kpi = label in _KEY_KPI_LABELS
 
-    ws.column_dimensions["A"].width = 45
-    ws.column_dimensions["B"].width = 35
+        label_cell = ws.cell(row=row_idx, column=1)
+        label_cell.font = Font(color=COLOR_TEXT_PRIMARY, bold=is_key_kpi)
+        label_cell.alignment = Alignment(horizontal="left", vertical="center")
+        label_cell.fill = PatternFill("solid", fgColor=fill_color)
+        label_cell.border = _THIN_BORDER
+
+        value_cell = ws.cell(row=row_idx, column=2)
+        value_cell.alignment = Alignment(horizontal="left", vertical="center")
+        value_cell.fill = PatternFill("solid", fgColor=fill_color)
+        value_cell.border = _THIN_BORDER
+        value_cell.font = Font(bold=True, color=COLOR_PRIMARY, size=12) if is_key_kpi else Font(color=COLOR_TEXT_PRIMARY)
+
+    ws.column_dimensions["A"].width = 48
+    ws.column_dimensions["B"].width = 38
+    ws.freeze_panes = f"A{header_row_idx + 1}"
+    _apply_print_setup(ws, header_row_idx)
+
+
+def _write_instructions_sheet(ws: Worksheet, banner_text: str) -> None:
+    """First worksheet: short, practical, business-English guide to reading this report. No business logic here."""
+    _write_banner(ws, banner_text, 2)
+
+    ws.append(["Benivo Operational Report -- Instructions"])
+    title_row = ws.max_row
+    ws.merge_cells(f"A{title_row}:B{title_row}")
+    title_cell = ws.cell(row=title_row, column=1)
+    title_cell.font = Font(bold=True, size=14, color=COLOR_PRIMARY)
+    ws.row_dimensions[title_row].height = 26
+    ws.append([])
+
+    sections = [
+        (
+            "Purpose",
+            "This workbook is the operational snapshot of the Benivo relocation-posting automation for one run. "
+            "It shows exactly which Jobvite candidates are ready, what would be (or was) sent to Benivo, and any "
+            "data-quality gaps -- built from the automation's own database and audit log, not a manual export.",
+        ),
+        (
+            "What the automation does",
+            "Each run synchronizes candidates in the \"Mobility in process\" Jobvite workflow, classifies their "
+            "readiness (relocation confirmed, start date resolved, office mapped), and -- outside of a dry run -- "
+            "creates the candidate in Benivo, then immediately follows up with a Case update carrying Job Title "
+            "and Home Country.",
+        ),
+        (
+            "How to read each worksheet",
+            "Executive Summary: run-level KPIs and distributions. Ready To Post: the clean, business view of "
+            "everyone about to be posted. Payload Preview: the exact technical fields the integration would send, "
+            "plus data-quality flags -- use this to troubleshoot a specific candidate. Posting Results: what "
+            "actually happened this run, read from the permanent audit log. Pending Office Mapping / Pending "
+            "Recruiter Review / Country Data Issues: exception lists needing action (only appear when non-empty). "
+            "Go-Live Status: where each candidate sits relative to the production go-live cutover.",
+        ),
+        (
+            "Meaning of the main statuses",
+            "READY_TO_POST: all requirements met, awaiting automatic posting. POSTED: successfully created in "
+            "Benivo. POST_FAILED: a posting attempt failed and will be retried automatically. "
+            "PENDING_OFFICE_MAPPING: the Jobvite workplace has no confirmed Benivo office yet. "
+            "NEEDS_RECRUITER_REVIEW: relocation is not confirmed \"Yes\".",
+        ),
+        (
+            "Mobility VIP / Policy Tier",
+            "\"Mobility VIP\" reflects Jobvite's own mobility_vip field (Yes/No). Current rule, confirmed by "
+            "Mobility (temporary until they define otherwise): Mobility VIP = Yes sends Policy Tier 2 to Benivo; "
+            "otherwise Tier 1.",
+        ),
+        (
+            "Jobvite Start Date vs Calculated Start Date",
+            "When Jobvite provides a start date, it is used as-is (source = JOBVITE). When it doesn't, the "
+            "automation calculates a fallback date under the existing, unchanged business rule (source = "
+            "CALCULATED) so a candidate is never blocked purely for a missing date.",
+        ),
+        (
+            "Candidate Home Country vs Current Location fallback",
+            "The candidate's own declared home country is used whenever present. If it's blank, the automation "
+            "falls back to their current location country instead of leaving the field empty -- the \"Country "
+            "Source\" column on each sheet shows which one was actually used for a given candidate.",
+        ),
+        (
+            "Go-Live categories",
+            "Pre-Go-Live Backlog: existed in scope before the production cutover -- excluded from automatic "
+            "posting even while still READY_TO_POST. Newly Eligible: entered scope after the cutover but isn't "
+            "fully ready yet. Automatically Eligible: entered scope after the cutover AND is READY_TO_POST -- "
+            "will be posted automatically. Already Posted: successfully posted, regardless of timing.",
+        ),
+    ]
+
+    for heading, body in sections:
+        ws.append([heading])
+        h_row = ws.max_row
+        ws.merge_cells(f"A{h_row}:B{h_row}")
+        h_cell = ws.cell(row=h_row, column=1)
+        h_cell.font = Font(bold=True, color="FFFFFF")
+        h_cell.fill = PatternFill("solid", fgColor=COLOR_PRIMARY)
+        h_cell.alignment = Alignment(vertical="center", indent=1)
+        ws.row_dimensions[h_row].height = 18
+
+        ws.append([body])
+        b_row = ws.max_row
+        ws.merge_cells(f"A{b_row}:B{b_row}")
+        b_cell = ws.cell(row=b_row, column=1)
+        b_cell.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left", indent=1)
+        b_cell.font = Font(color=COLOR_TEXT_PRIMARY)
+        b_cell.fill = PatternFill("solid", fgColor=COLOR_PRIMARY_SOFT)
+        ws.row_dimensions[b_row].height = 60
+        ws.append([])
+
+    ws.column_dimensions["A"].width = 70
+    ws.column_dimensions["B"].width = 30
+    ws.sheet_view.showGridLines = False
+    ws.page_setup.orientation = "portrait"
+    ws.page_setup.fitToWidth = 1
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
 
 
 def _fetch_refdata_if_allowed() -> Optional[Dict[str, Any]]:
@@ -603,10 +1015,26 @@ def generate_reports(
 
     all_candidates = candidate_repository.get_all_candidates_for_report()
     terminal_eids = post_log_repository.get_terminal_post_log_application_eids()
+    scope_history_map = candidate_repository.get_scope_history_map()
+    go_live_at = config.go_live_at()
     selected_eids = {c.get("application_eid") for c in selected_candidates}
     candidates_by_eid = {c.get("application_eid"): c for c in all_candidates}
 
     mobility_candidates = [c for c in all_candidates if c.get("workflow_state") == MOBILITY_WORKFLOW_STATE]
+
+    # Go-Live Status: covers the full in-scope population (not just
+    # READY_TO_POST), independent of benivo_status -- see
+    # _go_live_category()'s docstring for the exact classification rules.
+    go_live_status_rows = [
+        _build_go_live_status_row(c, scope_history_map.get(c.get("application_eid")), go_live_at)
+        for c in mobility_candidates
+    ]
+    go_live_already_posted_count = sum(1 for r in go_live_status_rows if r["go_live_category"] == GO_LIVE_ALREADY_POSTED)
+    go_live_pre_backlog_count = sum(1 for r in go_live_status_rows if r["go_live_category"] == GO_LIVE_PRE_GO_LIVE_BACKLOG)
+    go_live_auto_eligible_count = sum(
+        1 for r in go_live_status_rows if r["go_live_category"] == GO_LIVE_AUTOMATICALLY_ELIGIBLE
+    )
+    go_live_newly_eligible_count = sum(1 for r in go_live_status_rows if r["go_live_category"] == GO_LIVE_NEWLY_ELIGIBLE)
 
     vip_candidates = sum(1 for c in all_candidates if c.get("is_vip") is True)
 
@@ -695,6 +1123,20 @@ def generate_reports(
 
     country_data_issue_rows = [_build_country_data_issue_row(c) for c in country_data_issue_candidates]
 
+    # Mobility VIP / policy tier distribution -- same population scope as
+    # Country Source Distribution above (relocation_yes, not just
+    # READY_TO_POST) so both "distribution" sections in the Executive
+    # Summary answer the same question: "of everyone we could potentially
+    # post, how do they break down". Tier resolution goes through
+    # policy_service.resolve_policy_values() -- the one centralized place
+    # -- never re-derived here.
+    mobility_vip_tier_1_count = sum(
+        1 for c in relocation_yes if resolve_policy_values(c.get("is_vip"))[1] == "Tier 1"
+    )
+    mobility_vip_tier_2_count = sum(
+        1 for c in relocation_yes if resolve_policy_values(c.get("is_vip"))[1] == "Tier 2"
+    )
+
     # Posting Results: queried directly from benivo.post_log by run_id --
     # never from an in-memory result list. Empty for a dry run (nothing was
     # ever written under this run_id).
@@ -736,8 +1178,10 @@ def generate_reports(
         candidates_removed_display = sync_metrics.get("removed", "N/A")
 
     summary_rows: List[Any] = [
+        ("Run Information", SECTION_HEADER),
         ("Run Timestamp", _excel_safe(execution_timestamp)),
         ("Run Mode", "DRY RUN" if dry_run else "REAL"),
+        ("Processing Summary", SECTION_HEADER),
         ("Total Candidates", total_candidates),
         ("Candidates Synced", candidates_synced_display),
         ("Candidates Removed", candidates_removed_display),
@@ -751,8 +1195,12 @@ def generate_reports(
         ("Candidate Home Country", _count_with_pct(country_source_counts[SOURCE_CANDIDATE_HOME_COUNTRY], len(relocation_yes))),
         ("Current Location Fallback", _count_with_pct(country_source_counts[SOURCE_CURRENT_LOCATION], len(relocation_yes))),
         ("Missing", _count_with_pct(country_source_counts[SOURCE_MISSING], len(relocation_yes))),
+        ("Start Date Distribution", SECTION_HEADER),
         ("Jobvite Start Date", _count_with_pct(jobvite_start_date_count, len(relocation_yes))),
         ("Calculated Start Date", _count_with_pct(calculated_start_date_count, len(relocation_yes))),
+        ("Mobility VIP Distribution", SECTION_HEADER),
+        ("Tier 1", _count_with_pct(mobility_vip_tier_1_count, len(relocation_yes))),
+        ("Tier 2", _count_with_pct(mobility_vip_tier_2_count, len(relocation_yes))),
         ("Data Quality", SECTION_HEADER),
         ("Office Mapping Completeness", _pct(ready_to_post_count, ready_to_post_count + pending_office_mapping_count)),
         ("Home Country Completeness (Effective, Ready To Post)", _pct(ready_to_post_count - ready_missing_home_country, ready_to_post_count)),
@@ -760,20 +1208,40 @@ def generate_reports(
         ("Ready To Create User (Ready To Post)", _pct(ready_to_create_user_count, ready_to_post_count)),
         ("Ready To Update Case (Ready To Post)", _pct(ready_to_update_case_count, ready_to_post_count)),
         ("Fully Payload Ready (Ready To Post)", _pct(ready_payload_ready, ready_to_post_count)),
+        ("Go-Live Readiness", SECTION_HEADER),
+        ("Go-Live Cutover", _excel_safe(go_live_at) if go_live_at else "Not configured (no filtering applied yet)"),
+        (GO_LIVE_PRE_GO_LIVE_BACKLOG, _count_with_pct(go_live_pre_backlog_count, len(mobility_candidates))),
+        (GO_LIVE_NEWLY_ELIGIBLE, _count_with_pct(go_live_newly_eligible_count, len(mobility_candidates))),
+        (GO_LIVE_AUTOMATICALLY_ELIGIBLE, _count_with_pct(go_live_auto_eligible_count, len(mobility_candidates))),
+        (GO_LIVE_ALREADY_POSTED, _count_with_pct(go_live_already_posted_count, len(mobility_candidates))),
     ]
 
     wb = Workbook()
 
-    summary_ws = wb.active
-    summary_ws.title = "Executive Summary"
-    _write_summary_sheet(summary_ws, summary_rows)
+    # One consistent banner across every sheet -- report name, run
+    # timestamp, run mode. Presentation only; computed once here so every
+    # sheet shows the exact same values.
+    banner_text = (
+        f"Benivo Operational Report   |   Run: {execution_timestamp.strftime('%Y-%m-%d %H:%M UTC')}   |   "
+        f"Mode: {'DRY RUN' if dry_run else 'REAL'}"
+    )
 
-    _write_table_sheet(wb.create_sheet("Ready To Post"), ready_to_post_rows, columns=READY_TO_POST_COLUMNS)
+    instructions_ws = wb.active
+    instructions_ws.title = "Instructions"
+    _write_instructions_sheet(instructions_ws, banner_text)
+
+    summary_ws = wb.create_sheet("Executive Summary")
+    _write_summary_sheet(summary_ws, summary_rows, banner_text=banner_text)
+
+    _write_table_sheet(
+        wb.create_sheet("Ready To Post"), ready_to_post_rows, columns=READY_TO_POST_COLUMNS, banner_text=banner_text
+    )
     _write_table_sheet(
         wb.create_sheet("Posting Results"),
         posting_results_rows,
         empty_note=DRY_RUN_NOTE if dry_run else "No posting attempts were recorded in this run.",
         columns=POSTING_RESULTS_COLUMNS,
+        banner_text=banner_text,
     )
     # Exception-only sheets: a worksheet is created only when it has rows --
     # a clean state (e.g. Pending Office Mapping = 0) is still fully visible
@@ -781,19 +1249,25 @@ def generate_reports(
     # worksheet cluttering the workbook. Ready To Post, Posting Results, and
     # Payload Preview are core sheets and are always created.
     if missing_office_rows:
-        _write_table_sheet(wb.create_sheet("Pending Office Mapping"), missing_office_rows)
+        _write_table_sheet(wb.create_sheet("Pending Office Mapping"), missing_office_rows, banner_text=banner_text)
 
     if relocation_review_rows:
-        _write_table_sheet(wb.create_sheet("Pending Recruiter Review"), relocation_review_rows)
+        _write_table_sheet(wb.create_sheet("Pending Recruiter Review"), relocation_review_rows, banner_text=banner_text)
 
     if country_data_issue_rows:
         _write_table_sheet(
             wb.create_sheet("Country Data Issues"),
             country_data_issue_rows,
             columns=COUNTRY_DATA_ISSUES_COLUMNS,
+            banner_text=banner_text,
         )
 
-    _write_table_sheet(wb.create_sheet("Payload Preview"), payload_preview_rows, columns=PAYLOAD_PREVIEW_COLUMNS)
+    _write_table_sheet(
+        wb.create_sheet("Payload Preview"), payload_preview_rows, columns=PAYLOAD_PREVIEW_COLUMNS, banner_text=banner_text
+    )
+    _write_table_sheet(
+        wb.create_sheet("Go-Live Status"), go_live_status_rows, columns=GO_LIVE_STATUS_COLUMNS, banner_text=banner_text
+    )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     report_path = _report_dir() / f"{REPORT_FILENAME_PREFIX}_{timestamp}.xlsx"
@@ -821,6 +1295,12 @@ def generate_reports(
         "pending_recruiter_review": pending_recruiter_review_count,
         "pending_office_mapping": pending_office_mapping_count,
         "country_fallback": country_source_counts[SOURCE_CURRENT_LOCATION],
+        "go_live_pre_backlog": go_live_pre_backlog_count,
+        "go_live_newly_eligible": go_live_newly_eligible_count,
+        "go_live_automatically_eligible": go_live_auto_eligible_count,
+        "go_live_already_posted": go_live_already_posted_count,
+        "mobility_vip_tier_1": mobility_vip_tier_1_count,
+        "mobility_vip_tier_2": mobility_vip_tier_2_count,
     }
 
     return report_path, report_metrics

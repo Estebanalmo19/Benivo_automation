@@ -20,21 +20,25 @@ RELOCATION_VALUES = ("Yes", "No")
 DEFAULT_BENIVO_STATUS = "PENDING"
 
 # benivo_status, benivo_user_id, benivo_assignment_id, benivo_profile_url,
-# benivo_response, and is_vip are integration-owned: intentionally absent
-# from both the INSERT column list's dependency on source data and DO
-# UPDATE SET, so a sync never overwrites them. benivo_status is only set to
+# and benivo_response are integration-owned: intentionally absent from both
+# the INSERT column list's dependency on source data and DO UPDATE SET, so
+# a sync never overwrites them. benivo_status is only set to
 # DEFAULT_BENIVO_STATUS on first insert; classification happens later, in
 # classification_service.
 #
-# is_vip specifically: there is currently no confirmed Jobvite source field
-# for VIP (application/job customFields were inspected for this same reason
-# host_country/host_city/population/the old "vip" text field were ruled
-# out -- see below). is_vip is deliberately excluded from this UPSERT so new
-# rows get the column's own DEFAULT FALSE (migrations/0003) and existing
-# rows keep whatever value was set by classification/posting/manual review.
-# If a confirmed Jobvite source for VIP is ever identified, add it as a new
-# SELECT expression here (same pattern as start_date/workplace below) AND
-# add it to the DO UPDATE SET list so it becomes source-refreshed like them.
+# is_vip: confirmed 2026-08-24 -- application.customField[fieldCode=
+# 'mobility_vip'] (values "Yes"/"No") is the real Jobvite source for VIP,
+# superseding the earlier finding that no confirmed source existed (that
+# finding covered host_country/host_city/population/the old unconfirmed
+# "vip" text column -- NOT this field, which didn't exist in Jobvite yet at
+# the time). is_vip IS now source-owned and refreshed every sync, exactly
+# like start_date/workplace/home_country below: TRUE only when
+# mobility_vip = 'Yes', FALSE when it's 'No' or the field is absent
+# entirely (COALESCE guards the "absent" case, since a raw SQL comparison
+# against NULL would itself evaluate to NULL, not FALSE). See
+# app/services/policy_service.py for the one centralized place this value
+# feeds into a Benivo policy tier -- never duplicate that mapping here or
+# anywhere else.
 #
 # start_date, workplace, and home_country ARE source-owned and must be
 # refreshed every sync (per confirmed evidence, see git history and the
@@ -85,6 +89,7 @@ INSERT INTO benivo.candidates (
     workplace,
     home_country,
     current_country,
+    is_vip,
     source_payload,
     benivo_status,
     updated_at
@@ -120,6 +125,15 @@ SELECT
         LIMIT 1
     ) AS home_country,
     NULLIF(j.raw_payload->>'countryName', '') AS current_country,
+    COALESCE(
+        (
+            SELECT app_cf->>'value'
+            FROM jsonb_array_elements(j.raw_payload->'application'->'customField') app_cf
+            WHERE app_cf->>'fieldCode' = 'mobility_vip'
+            LIMIT 1
+        ) = 'Yes',
+        FALSE
+    ) AS is_vip,
     j.raw_payload,
     %(default_status)s,
     NOW()
@@ -147,8 +161,32 @@ DO UPDATE SET
     workplace = EXCLUDED.workplace,
     home_country = EXCLUDED.home_country,
     current_country = EXCLUDED.current_country,
+    is_vip = EXCLUDED.is_vip,
     source_payload = EXCLUDED.source_payload,
     updated_at = NOW();
+"""
+
+# Durable, append-only record of the first time an application_eid was ever
+# detected inside this same scope predicate -- see migrations/0008 and
+# app/config.go_live_at()/candidate_repository.get_ready_candidates() for
+# how it gates automatic posting on go-live. ON CONFLICT DO NOTHING is the
+# whole mechanism: an application_eid is inserted here exactly once, ever,
+# so first_seen_in_scope_at survives _DELETE_OUT_OF_SCOPE_SQL below
+# removing (and a later sync re-inserting) the SAME application_eid's
+# benivo.candidates row any number of times -- a candidate leaving Mobility
+# and re-entering later never looks "new" again. Uses the identical scope
+# predicate as _UPSERT_SQL so the two never disagree about who's in scope.
+_SCOPE_HISTORY_UPSERT_SQL = """
+INSERT INTO benivo.scope_history (application_eid, candidate_eid, first_seen_in_scope_at)
+SELECT DISTINCT j.application_eid, j.candidate_eid, NOW()
+FROM jv_arrise_data_schema.jobvite_applications j
+CROSS JOIN LATERAL jsonb_array_elements(
+    j.raw_payload->'application'->'customField'
+) cf
+WHERE j.workflow_state = %(workflow_state)s
+  AND cf->>'fieldCode' = %(relocation_field_code)s
+  AND cf->>'value' IN %(relocation_values)s
+ON CONFLICT (application_eid) DO NOTHING;
 """
 
 # Removes candidates that no longer belong to the active source universe
@@ -195,6 +233,11 @@ def sync_candidates() -> Dict[str, Any]:
         with transaction() as cur:
             cur.execute(_UPSERT_SQL, params)
             upserted = cur.rowcount
+
+            # Must run BEFORE the delete below and in the same transaction:
+            # this is what makes first_seen_in_scope_at durable across a
+            # candidate leaving and later re-entering scope in-between syncs.
+            cur.execute(_SCOPE_HISTORY_UPSERT_SQL, params)
 
             cur.execute(_DELETE_OUT_OF_SCOPE_SQL, params)
             removed = cur.rowcount

@@ -56,3 +56,21 @@ def test_uat_application_eid_strips_whitespace(monkeypatch):
 def test_max_candidates_falls_back_on_invalid(monkeypatch):
     monkeypatch.setenv("BENIVO_MAX_CANDIDATES", "-3")
     assert config.max_candidates() == 1
+
+
+def test_go_live_at_none_when_unset(monkeypatch):
+    monkeypatch.delenv("BENIVO_GO_LIVE_AT", raising=False)
+    assert config.go_live_at() is None
+
+
+def test_go_live_at_parses_iso8601_z_suffix(monkeypatch):
+    monkeypatch.setenv("BENIVO_GO_LIVE_AT", "2026-09-01T00:00:00Z")
+    result = config.go_live_at()
+    assert result.year == 2026 and result.month == 9 and result.day == 1
+    assert result.tzinfo is not None
+
+
+def test_go_live_at_raises_on_malformed_value(monkeypatch):
+    monkeypatch.setenv("BENIVO_GO_LIVE_AT", "not-a-date")
+    with pytest.raises(ValueError):
+        config.go_live_at()

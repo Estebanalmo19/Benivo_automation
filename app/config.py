@@ -16,6 +16,7 @@ via monkeypatch.setenv() + calling the function again.
 """
 
 import os
+from datetime import datetime
 from typing import List, Optional
 
 from dotenv import load_dotenv
@@ -36,6 +37,20 @@ BENIVO_CLIENT_ID = os.getenv("BENIVO_CLIENT_ID")
 BENIVO_CLIENT_SECRET = os.getenv("BENIVO_CLIENT_SECRET")
 BENIVO_GRANT_TYPE = os.getenv("BENIVO_GRANT_TYPE")
 
+# --- Benivo API endpoints (required, static) -----------------------------------
+# Every Benivo HTTP endpoint the app calls is environment-driven -- see
+# app/clients/benivo_client.py, which references these exclusively and never
+# hardcodes a URL. Switching the whole app from UAT to Production is
+# intended to be ONLY a matter of setting these five values (plus
+# BENIVO_CLIENT_ID/SECRET) in .env; no Python source code should need to
+# change. Production values are not yet confirmed as of 2026-08-21 -- see
+# .env.example, which documents the current confirmed UAT values only.
+BENIVO_TOKEN_URL = os.getenv("BENIVO_TOKEN_URL")
+BENIVO_REFDATA_URL = os.getenv("BENIVO_REFDATA_URL")
+BENIVO_CREATE_USER_URL = os.getenv("BENIVO_CREATE_USER_URL")
+BENIVO_USER_LOOKUP_URL = os.getenv("BENIVO_USER_LOOKUP_URL")
+BENIVO_CASE_URL = os.getenv("BENIVO_CASE_URL")
+
 REQUIRED_SETTINGS = {
     "DB_HOST": DB_HOST,
     "DB_PORT": DB_PORT,
@@ -45,6 +60,11 @@ REQUIRED_SETTINGS = {
     "BENIVO_CLIENT_ID": BENIVO_CLIENT_ID,
     "BENIVO_CLIENT_SECRET": BENIVO_CLIENT_SECRET,
     "BENIVO_GRANT_TYPE": BENIVO_GRANT_TYPE,
+    "BENIVO_TOKEN_URL": BENIVO_TOKEN_URL,
+    "BENIVO_REFDATA_URL": BENIVO_REFDATA_URL,
+    "BENIVO_CREATE_USER_URL": BENIVO_CREATE_USER_URL,
+    "BENIVO_USER_LOOKUP_URL": BENIVO_USER_LOOKUP_URL,
+    "BENIVO_CASE_URL": BENIVO_CASE_URL,
 }
 
 
@@ -83,6 +103,31 @@ def allow_reference_data_calls() -> bool:
 def uat_application_eid() -> Optional[str]:
     raw = os.getenv("BENIVO_UAT_APPLICATION_EID")
     return raw.strip() if raw and raw.strip() else None
+
+
+def go_live_at() -> Optional[datetime]:
+    """
+    Production go-live cutover, ISO 8601 (e.g. "2026-09-01T00:00:00Z").
+    Unset by default -- while unset, candidate_repository.get_ready_candidates()
+    applies no go-live filtering at all (today's exact behavior, nothing
+    changes until this is deliberately set).
+
+    Set this ONCE, at the actual go-live moment, and only AFTER the
+    benivo.scope_history baseline backfill (see
+    scripts/backfill_scope_history.py) has already been run -- otherwise
+    every pre-existing backlog candidate would have no scope_history row
+    yet and would be excluded from auto-posting forever, never becoming
+    "Automatically Eligible" even after go-live, since a candidate is only
+    ever inserted into scope_history once (see synchronization_service.py).
+    A malformed value raises immediately rather than silently disabling the
+    gate -- see app.config's own "fail clearly, never guess" convention.
+    """
+    raw = os.getenv("BENIVO_GO_LIVE_AT")
+
+    if not raw or not raw.strip():
+        return None
+
+    return datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
 
 
 def legacy_max_candidates(default: int = 1) -> int:

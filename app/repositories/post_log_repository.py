@@ -57,6 +57,12 @@ def insert_post_log_row(cur, row: Dict[str, Any]) -> None:
     calls this and candidate_repository.update_candidate_after_posting
     together in one transaction, per the confirmed rule that a post_log
     write and its candidate status update must never partially succeed).
+
+    REQUIRES migrations/0009_add_http_status_code_to_post_log.sql to be
+    applied first -- this INSERT references benivo.post_log.http_status_code,
+    which does not exist until that migration runs. Do not deploy this
+    version of the function before that migration is applied, or every
+    post_log write (CREATE_USER and UPDATE_CASE alike) will fail.
     """
     cur.execute(
         """
@@ -66,9 +72,10 @@ def insert_post_log_row(cur, row: Dict[str, Any]) -> None:
             benivo_user_id, benivo_assignment_id, benivo_profile_url,
             request_payload, response_payload, error_message,
             execution_date, effective_start_date, start_date_source,
+            http_status_code,
             posted_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
         """,
         (
             row["run_id"],
@@ -89,5 +96,6 @@ def insert_post_log_row(cur, row: Dict[str, Any]) -> None:
             row.get("execution_date"),
             row.get("effective_start_date"),
             row.get("start_date_source"),
+            row.get("http_status_code"),
         ),
     )

@@ -148,7 +148,13 @@ def test_validate_uat_candidate_no_refdata_means_office_unresolved():
     assert result["checks"]["office_resolved"] is False
 
 
-def test_validate_uat_candidate_vip_fails_policy_check():
+def test_validate_uat_candidate_vip_still_fails_the_basic_only_uat_gate():
+    # Confirmed 2026-08-24: VIP now resolves to a confirmed policy tier
+    # ("Tier 2"), so policy_api_value_confirmed and payload_valid flip to
+    # True -- but the single-candidate UAT safety override is deliberately
+    # stricter than general readiness and still requires exactly "Basic"
+    # (policy_name_is_basic), so a VIP candidate remains ineligible for
+    # this specific gate regardless.
     candidate = _eligible_candidate(is_vip=True)
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
          patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
@@ -156,10 +162,10 @@ def test_validate_uat_candidate_vip_fails_policy_check():
 
     assert result["eligible"] is False
     assert result["checks"]["policy_name_is_basic"] is False
-    assert result["checks"]["policy_api_value_confirmed"] is False  # no confirmed Benivo API value for VIP
-    assert result["checks"]["payload_valid"] is False  # policy=None fails payload validation too
+    assert result["checks"]["policy_api_value_confirmed"] is True
+    assert result["checks"]["payload_valid"] is True
     assert result["summary"]["policy_name"] == "VIP"
-    assert result["summary"]["policy_api_value"] is None
+    assert result["summary"]["policy_api_value"] == "Tier 2"
 
 
 def test_validate_payload_requires_all_fields():

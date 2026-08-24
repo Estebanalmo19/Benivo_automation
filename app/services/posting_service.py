@@ -20,6 +20,7 @@ from app.models.domain import ACTION_CREATE_USER, ACTION_UPDATE_CASE, POST_LOG_S
 from app.repositories import candidate_repository, post_log_repository
 from app.repositories.candidate_repository import get_candidate_by_application_eid, get_ready_candidates
 from app.repositories.post_log_repository import get_terminal_post_log_application_eids, insert_post_log_row
+from app.services.country_code_service import resolve_iso2 as resolve_country_iso2
 from app.services.home_country_service import resolve_effective_home_country
 from app.services.office_resolution_service import resolve_office
 from app.services.policy_service import resolve_policy_values
@@ -248,23 +249,43 @@ def build_case_update_payload(candidate: Dict[str, Any], case_id: Any) -> Dict[s
       - Job Title -> hostJobRole.
       - effective home country -> homeLocation.country.
 
-    Only these three keys are sent. No other Case field has been confirmed
-    -- guessing one risks the same silent-rejection failure mode that
-    "policy": "Basic" caused before "Tier 1" was confirmed. Values are sent
-    as-is (including None when nothing resolves) -- this call is
-    best-effort and never blocks or reverses the create-user result, see
-    post_single_candidate().
+    Contract confirmed 2026-08-19 by Gina (Benivo) after a real UAT PATCH
+    returned error 999: the endpoint requires a findBy/data envelope, not a
+    flat body -- caseId identifies the case under "findBy", and the fields
+    being updated go under "data". Sending a flat {"caseId": ..., ...} body
+    is what caused the 999.
 
-    homeLocation.country uses home_country_service.resolve_effective_home_country()
-    -- the exact same resolution build_benivo_payload() uses for
-    homeCountry -- so both payloads for the same candidate always agree.
+    Contract confirmed 2026-08-21 by a real Benivo UAT PATCH: unlike
+    create-user's homeCountry, homeLocation.country here must be a 2-character
+    ISO 3166-1 alpha-2 code, not the full country name (a full name causes
+    error 4422). See country_code_service.resolve_iso2() -- used ONLY here,
+    never for create-user's homeCountry (build_benivo_payload()), since
+    there is no evidence create-user needs the same conversion. Fails
+    safely: an unresolvable country name becomes None here (never a guessed
+    code), the same way officeId/policy fail safely elsewhere in this file.
+
+    Only these two data fields are sent (hostJobRole, homeLocation.country).
+    No other Case field has been confirmed -- guessing one risks the same
+    silent-rejection failure mode that "policy": "Basic" caused before
+    "Tier 1" was confirmed. Values are sent as-is (including None when
+    nothing resolves) -- this call is best-effort and never blocks or
+    reverses the create-user result, see post_single_candidate().
+
+    The underlying country resolution (home_country_service.
+    resolve_effective_home_country()) is the exact same one
+    build_benivo_payload() uses for homeCountry -- so both payloads for the
+    same candidate always agree on WHICH country, even though this one goes
+    on to convert it to an ISO code and the other doesn't.
     """
     effective_home_country, _home_country_source = resolve_effective_home_country(candidate)
+    home_country_iso2 = resolve_country_iso2(effective_home_country)
 
     return {
-        "caseId": case_id,
-        "hostJobRole": candidate.get("job_title"),
-        "homeLocation": {"country": effective_home_country},
+        "findBy": {"caseId": case_id},
+        "data": {
+            "hostJobRole": candidate.get("job_title"),
+            "homeLocation": {"country": home_country_iso2},
+        },
     }
 
 
@@ -369,6 +390,7 @@ def post_single_candidate(
             "benivo_user_id": None,
             "benivo_assignment_id": None,
             "benivo_profile_url": None,
+            "status_code": create_result.get("status_code"),
             **audit_fields,
         }
 
@@ -385,10 +407,11 @@ def post_single_candidate(
 
     if not case_patch_result["success"]:
         logger.error(
-            "Case PATCH failed for application_eid=%s (caseId=%s): %s -- "
+            "Case PATCH failed for application_eid=%s (caseId=%s, http_status_code=%s): %s -- "
             "create-user already succeeded, candidate status is unaffected.",
             candidate.get("application_eid"),
             case_id,
+            case_patch_result.get("status_code"),
             case_patch_result.get("error"),
         )
 
@@ -396,6 +419,7 @@ def post_single_candidate(
         "attempted": True,
         "success": case_patch_result["success"],
         "case_id": case_id,
+        "status_code": case_patch_result.get("status_code"),
         "request_payload": case_payload,
         "response_payload": case_patch_result.get("raw_response"),
         "error_message": case_patch_result.get("error"),
@@ -410,6 +434,7 @@ def post_single_candidate(
         "benivo_assignment_id": case_id,
         # Not confirmed in any real Benivo response inspected so far.
         "benivo_profile_url": created.get("profileUrl"),
+        "status_code": create_result.get("status_code"),
         "case_update": case_update,
         **audit_fields,
     }
@@ -505,10 +530,12 @@ def build_post_log_insert(run_id: str, candidate: Dict[str, Any], result: Dict[s
     Pure: maps a candidate + posting result to the exact benivo.post_log
     column values. No I/O.
 
-    execution_date/effective_start_date/start_date_source come from
-    `result` (set by post_single_candidate()) via .get() -- callers/tests
-    that construct a `result` dict without them (predating this rule) still
-    work, just recording NULL for these three audit columns.
+    execution_date/effective_start_date/start_date_source/http_status_code
+    come from `result` (set by post_single_candidate()) via .get() --
+    callers/tests that construct a `result` dict without them (predating
+    these rules) still work, just recording NULL. http_status_code needs
+    migrations/0009 (proposed, not yet applied) before it can actually be
+    persisted -- see post_log_repository.insert_post_log_row().
     """
     post_log_status = _post_log_status_from_outcome(result["outcome"])
     is_vip = candidate.get("is_vip")
@@ -533,6 +560,7 @@ def build_post_log_insert(run_id: str, candidate: Dict[str, Any], result: Dict[s
         "execution_date": result.get("execution_date"),
         "effective_start_date": result.get("effective_start_date"),
         "start_date_source": result.get("start_date_source"),
+        "http_status_code": result.get("status_code"),
     }
 
 
@@ -571,6 +599,7 @@ def build_case_update_post_log_insert(run_id: str, candidate: Dict[str, Any], ca
         "execution_date": None,
         "effective_start_date": None,
         "start_date_source": None,
+        "http_status_code": case_update.get("status_code"),
     }
 
 

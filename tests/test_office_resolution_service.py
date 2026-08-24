@@ -25,6 +25,10 @@ UAT_OFFICES = [
     "jobvite_workplace, expected_office_name, expected_office_id, expected_host_country",
     [
         ("RAK Live Casino", "UAE (Live Casino)", "ca081aff-d1f3-407a-afdd-adb836563d31", "UAE"),
+        # Confirmed 2026-08-24: application_eid=penv7zwh's actual Jobvite
+        # site value is the bare string "UAE", not "RAK Live Casino" --
+        # distinct workplace value, same target office.
+        ("UAE", "UAE (Live Casino)", "ca081aff-d1f3-407a-afdd-adb836563d31", "UAE"),
         ("Serbia Live Casino", "Serbia (Live Casino)", "68da6b8b-1e07-4742-9333-a882e284c3fb", "Serbia"),
         ("Colombia Live Casino", "Colombia (Live Casino)", "d715fdb6-c93c-4940-a076-918214ca152d", "Colombia"),
         ("Bulgaria Live Casino", "Bulgaria (Live Casino)", "32efc23b-9a5b-4c9d-a304-747c7844a584", "Bulgaria"),
@@ -54,6 +58,9 @@ def test_resolve_office_translates_and_retrieves_real_uuid(
         ("RAK Live Casino", "UAE (Live Casino)"),
         ("rak live casino", "UAE (Live Casino)"),
         ("  RAK   Live   Casino  ", "UAE (Live Casino)"),
+        ("UAE", "UAE (Live Casino)"),
+        ("uae", "UAE (Live Casino)"),
+        ("  UAE  ", "UAE (Live Casino)"),
         ("Serbia Live Casino", "Serbia (Live Casino)"),
         ("Colombia Live Casino", "Colombia (Live Casino)"),
     ],
@@ -67,6 +74,13 @@ def test_resolve_office_name_never_fuzzy_or_partial_matches():
     # only an exact (normalized) match against the explicit mapping key.
     assert office_resolution.resolve_office_name("RAK") is None
     assert office_resolution.resolve_office_name("RAK Live Casino Extra") is None
+
+
+def test_resolve_office_name_uae_maps_to_live_casino_not_global():
+    # "UAE" and "UAE (Global)" are two distinct, both-real Benivo offices --
+    # confirm the bare workplace value "UAE" resolves to the Live Casino
+    # one specifically, per confirmed business intent, not Global.
+    assert office_resolution.resolve_office_name("UAE") == "UAE (Live Casino)"
     assert office_resolution.resolve_office_name("Live Casino") is None
 
 

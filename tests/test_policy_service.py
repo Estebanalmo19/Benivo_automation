@@ -17,8 +17,11 @@ def test_resolve_policy_api_value_basic_confirmed():
     assert policy_service.resolve_policy_api_value("Basic") == "Tier 1"
 
 
-def test_resolve_policy_api_value_vip_unconfirmed_returns_none():
-    assert policy_service.resolve_policy_api_value("VIP") is None
+def test_resolve_policy_api_value_vip_maps_to_tier_2():
+    # Confirmed 2026-08-24: temporary business rule until Mobility defines
+    # otherwise -- mobility_vip == "Yes" -> is_vip True -> policy_name VIP
+    # -> policy_api_value "Tier 2".
+    assert policy_service.resolve_policy_api_value("VIP") == "Tier 2"
 
 
 def test_resolve_policy_api_value_unknown_policy_name_blocks():
@@ -31,7 +34,7 @@ def test_resolve_policy_values_basic():
     assert policy_api_value == "Tier 1"
 
 
-def test_resolve_policy_values_vip_blocks():
+def test_resolve_policy_values_vip_resolves_to_tier_2():
     policy_name, policy_api_value = policy_service.resolve_policy_values(True)
     assert policy_name == "VIP"
-    assert policy_api_value is None
+    assert policy_api_value == "Tier 2"

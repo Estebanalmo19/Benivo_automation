@@ -1,0 +1,61 @@
+-- PROPOSAL ONLY -- NOT YET APPLIED. Reviewed 2026-08-24 and judged safe
+-- (nullable ADD COLUMN IF NOT EXISTS, no default computation, no table
+-- rewrite, fully idempotent) -- the code that WRITES to this column has
+-- been finished (see below), specifically so it's ready to ship in the
+-- same deploy as this migration. That code is UNSAFE to deploy on its own
+-- before this migration runs: post_log_repository.insert_post_log_row()
+-- now references http_status_code in its INSERT, so every post_log write
+-- (CREATE_USER and UPDATE_CASE alike) will fail with an
+-- undefined-column error until this migration has been applied.
+--
+-- Adds benivo.post_log.http_status_code: the literal HTTP status code
+-- returned by the Benivo call this row audits (currently populated
+-- in-memory by benivo_client.update_case()/create_user() and threaded
+-- through posting_service.post_single_candidate()'s case_update dict, but
+-- not yet persisted anywhere -- see the 2026-08-21 incident where a real
+-- UAT Case PATCH was misreported as FAILED with an empty response body
+-- and no durable record of the actual (non-200) status code it received).
+--
+-- Why a new column rather than reusing an existing one:
+--   - response_payload is documented and relied on elsewhere (see
+--     app/services/reporting_service.py, docs/PHASE1_ARCHITECTURE.md) as
+--     Benivo's raw response VERBATIM. Injecting a synthetic status_code
+--     key into it would corrupt that invariant for every future
+--     UPDATE_CASE row and make CREATE_USER/UPDATE_CASE response_payload
+--     shapes inconsistent with each other.
+--   - error_message is a free-text/JSON-string field only populated on
+--     failure -- a genuinely successful 2xx call (204 No Content
+--     included) has no error_message to attach it to, so it would be
+--     silently lost on exactly the calls (204, 202) this fix cares most
+--     about proving actually succeeded.
+--
+-- Nullable, applies to any action (not Case-PATCH-specific) so a future
+-- CREATE_USER caller could populate it too -- optional, no immediate
+-- requirement to backfill or make it NOT NULL.
+--
+-- Non-destructive: ADD COLUMN IF NOT EXISTS is idempotent, nullable,
+-- default NULL for all existing rows.
+--
+-- DO NOT APPLY THIS MIGRATION until explicitly approved.
+--
+-- Code wiring completed 2026-08-24 (ahead of the migration, per explicit
+-- request -- ships together, migration first):
+--   1. post_log_repository.insert_post_log_row() -- http_status_code added
+--      to the INSERT column list and VALUES tuple. DONE.
+--   2. posting_service.build_case_update_post_log_insert() --
+--      "http_status_code": case_update.get("status_code"). DONE.
+--   3. posting_service.build_post_log_insert() --
+--      "http_status_code": result.get("status_code"). DONE -- create_user()
+--      already returned status_code at the client layer; it's now also
+--      threaded through every post_single_candidate() return path
+--      (office-unresolved/invalid-payload/already-exists paths have no
+--      create-user HTTP call, so status_code is simply absent/None there,
+--      same as every other create-user-specific field on those paths).
+--
+-- Required deployment order (same shape as migrations/0008):
+--   1. Apply this migration.
+--   2. Only then deploy this code -- deploying it first breaks every
+--      post_log write immediately (undefined column).
+
+ALTER TABLE benivo.post_log
+    ADD COLUMN IF NOT EXISTS http_status_code INTEGER;

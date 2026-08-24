@@ -1,5 +1,6 @@
 """Read/write access to benivo.candidates. No business rules here -- see app/services."""
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app import config
@@ -36,8 +37,25 @@ def get_max_candidates(default: Optional[int] = None) -> int:
 
 
 def get_ready_candidates(limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Deterministic, oldest-first, SQL-limited selection of postable candidates."""
+    """
+    Deterministic, oldest-first, SQL-limited selection of postable
+    candidates.
+
+    Go-live gating (see docs/PHASE1_ARCHITECTURE.md's Go-Live section):
+    when config.go_live_at() is set, a candidate is only auto-selected if
+    benivo.scope_history records it as first seen in the Benivo posting
+    scope ON OR AFTER that cutover -- see migrations/0008 and
+    synchronization_service.py, which is the only writer of that table.
+    A candidate with no scope_history row at all is conservatively excluded
+    (never auto-posted on unproven "new" status) rather than assumed new.
+    This is purely a selection-time filter: benivo_status is completely
+    untouched by it, so an excluded backlog candidate still shows
+    READY_TO_POST everywhere else (report, DB, UAT override) exactly as
+    before go-live was configured. While go_live_at is unset, this adds no
+    filtering at all -- today's exact pre-go-live behavior.
+    """
     max_candidates = limit if limit is not None else get_max_candidates()
+    go_live_at = config.go_live_at()
 
     query = f"""
         SELECT {READY_CANDIDATE_FIELDS}
@@ -53,6 +71,15 @@ def get_ready_candidates(limit: Optional[int] = None) -> List[Dict[str, Any]]:
                 AND pl.action = %(create_user_action)s
                 AND pl.status = ANY(%(terminal_statuses)s)
           )
+          AND (
+              %(go_live_at)s IS NULL
+              OR EXISTS (
+                  SELECT 1
+                  FROM benivo.scope_history sh
+                  WHERE sh.application_eid = c.application_eid
+                    AND sh.first_seen_in_scope_at >= %(go_live_at)s
+              )
+          )
         ORDER BY c.created_at, c.id
         LIMIT %(limit)s
     """
@@ -63,10 +90,24 @@ def get_ready_candidates(limit: Optional[int] = None) -> List[Dict[str, Any]]:
             {
                 "create_user_action": ACTION_CREATE_USER,
                 "terminal_statuses": list(TERMINAL_POST_LOG_STATUSES),
+                "go_live_at": go_live_at,
                 "limit": max_candidates,
             },
         )
         return [dict(row) for row in cur.fetchall()]
+
+
+def get_scope_history_map() -> Dict[str, datetime]:
+    """
+    application_eid -> first_seen_in_scope_at, from the durable
+    benivo.scope_history audit table (see migrations/0008). Report-only
+    read used by reporting_service.py to compute the go-live category
+    without touching benivo_status -- see get_ready_candidates() for the
+    actual posting-selection use of the same table.
+    """
+    with db_cursor() as cur:
+        cur.execute("SELECT application_eid, first_seen_in_scope_at FROM benivo.scope_history")
+        return {row["application_eid"]: row["first_seen_in_scope_at"] for row in cur.fetchall()}
 
 
 def get_candidates_missing_start_date() -> List[Dict[str, Any]]:

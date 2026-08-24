@@ -231,9 +231,11 @@ def test_dry_run_preview_includes_home_country_and_case_update_payload(monkeypat
     mock_get.assert_not_called()
     assert results[0]["payload"]["homeCountry"] == "Serbia"
     assert results[0]["case_update_payload_preview"] == {
-        "caseId": None,
-        "hostJobRole": "Game Presenter",
-        "homeLocation": {"country": "Serbia"},
+        "findBy": {"caseId": None},
+        "data": {
+            "hostJobRole": "Game Presenter",
+            "homeLocation": {"country": "RS"},
+        },
     }
 
 
@@ -312,15 +314,15 @@ def test_build_benivo_payload_sends_policy_api_value_not_business_label():
     assert posting.build_benivo_payload(candidate_basic, office, datetime.date(2026, 1, 1))["policy"] == "Tier 1"
 
 
-def test_build_benivo_payload_vip_has_no_confirmed_api_value_so_policy_is_none():
-    # No confirmed Benivo API value exists for VIP -- payload["policy"] must
-    # be None (never guessed), which blocks the payload from validating.
+def test_build_benivo_payload_vip_resolves_to_tier_2_and_validates():
+    # Confirmed 2026-08-24 (temporary business rule): mobility_vip == "Yes"
+    # -> is_vip True -> policy = "Tier 2", no longer blocked from posting.
     candidate_vip = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": True, "start_date": None}
     office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
 
     payload = posting.build_benivo_payload(candidate_vip, office, datetime.date(2026, 1, 1))
-    assert payload["policy"] is None
-    assert posting._validate_payload(payload) is False
+    assert payload["policy"] == "Tier 2"
+    assert posting._validate_payload(payload) is True
 
 
 def test_build_benivo_payload_sends_effective_start_date_not_raw_candidate_start_date():
@@ -400,9 +402,11 @@ def test_build_case_update_payload_sends_only_confirmed_fields():
     payload = posting.build_case_update_payload(candidate, case_id=1010644)
 
     assert payload == {
-        "caseId": 1010644,
-        "hostJobRole": "Game Presenter",
-        "homeLocation": {"country": "Serbia"},
+        "findBy": {"caseId": 1010644},
+        "data": {
+            "hostJobRole": "Game Presenter",
+            "homeLocation": {"country": "RS"},
+        },
     }
 
 
@@ -410,9 +414,11 @@ def test_build_case_update_payload_handles_missing_fields():
     payload = posting.build_case_update_payload({}, case_id=None)
 
     assert payload == {
-        "caseId": None,
-        "hostJobRole": None,
-        "homeLocation": {"country": None},
+        "findBy": {"caseId": None},
+        "data": {
+            "hostJobRole": None,
+            "homeLocation": {"country": None},
+        },
     }
 
 
@@ -421,12 +427,34 @@ def test_build_case_update_payload_falls_back_to_current_country():
 
     payload = posting.build_case_update_payload(candidate, case_id=1010644)
 
-    assert payload["homeLocation"]["country"] == "United Arab Emirates"
+    assert payload["data"]["homeLocation"]["country"] == "AE"
 
 
-def test_build_case_update_payload_agrees_with_create_user_payload_on_home_country():
+def test_build_case_update_payload_converts_country_name_to_iso2():
+    # Confirmed 2026-08-21 by a real Benivo UAT PATCH: error 4422 ("must be
+    # a valid 2-character country code") if the full name is sent instead.
+    candidate = {"job_title": "Game Presenter", "home_country": "United States"}
+
+    payload = posting.build_case_update_payload(candidate, case_id=1010644)
+
+    assert payload["data"]["homeLocation"]["country"] == "US"
+
+
+def test_build_case_update_payload_country_none_when_unresolvable():
+    # Fails safely: a country with no confirmed ISO mapping must never send
+    # a guessed code -- None, same as any other unconfirmed field.
+    candidate = {"job_title": "Game Presenter", "home_country": "Neverland"}
+
+    payload = posting.build_case_update_payload(candidate, case_id=1010644)
+
+    assert payload["data"]["homeLocation"]["country"] is None
+
+
+def test_build_case_update_payload_agrees_with_create_user_payload_on_underlying_country():
     # Both payloads must resolve the same candidate's home country
-    # identically -- see build_case_update_payload()'s docstring.
+    # identically before conversion -- see build_case_update_payload()'s
+    # docstring. create-user sends the plain name; the Case PATCH converts
+    # that exact same resolved name to its ISO 3166-1 alpha-2 code.
     candidate = {
         "first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False,
         "job_title": "Game Presenter", "home_country": None, "current_country": "Belarus",
@@ -436,7 +464,8 @@ def test_build_case_update_payload_agrees_with_create_user_payload_on_home_count
     create_payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
     case_payload = posting.build_case_update_payload(candidate, case_id=1)
 
-    assert create_payload["homeCountry"] == case_payload["homeLocation"]["country"] == "Belarus"
+    assert create_payload["homeCountry"] == "Belarus"
+    assert case_payload["data"]["homeLocation"]["country"] == "BY"
 
 
 # ---------------------------------------------------------------------------
@@ -480,14 +509,46 @@ def test_post_single_candidate_calls_case_patch_after_successful_create_user():
         result = posting.post_single_candidate("fake-token", candidate, refdata, EXECUTION_TIMESTAMP)
 
     assert result["outcome"] == "success"
+    assert result["status_code"] == 200  # top-level create-user HTTP status
     assert result["case_update"]["success"] is True
+    assert result["case_update"]["status_code"] == 200
     assert result["case_update"]["case_id"] == 1010644
     assert result["case_update"]["request_payload"] == {
-        "caseId": 1010644,
-        "hostJobRole": "Game Presenter",
-        "homeLocation": {"country": "Serbia"},
+        "findBy": {"caseId": 1010644},
+        "data": {
+            "hostJobRole": "Game Presenter",
+            "homeLocation": {"country": "RS"},
+        },
     }
     mock_patch.assert_called_once()
+
+
+def test_post_single_candidate_case_patch_succeeds_on_204_no_content():
+    # Regression test for the 2026-08-21 misreport: a real Benivo 204
+    # No Content response must be recorded as success=True, not FAILED.
+    case_response = MagicMock(status_code=204, content=b"")
+
+    refdata = {"offices": [{"id": "office-1", "officeName": "Colombia (Live Casino)"}]}
+    candidate = {
+        "application_eid": "APP-1",
+        "email": "jane@example.com",
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "workplace": "Colombia Live Casino",
+        "start_date": datetime.date(2026, 1, 1),
+        "is_vip": False,
+        "job_title": "Game Presenter",
+        "home_country": "Serbia",
+    }
+
+    with patch(BENIVO_POST, side_effect=[_lookup_not_found_response(), _create_response()]), \
+         patch(BENIVO_PATCH, return_value=case_response):
+        result = posting.post_single_candidate("fake-token", candidate, refdata, EXECUTION_TIMESTAMP)
+
+    assert result["case_update"]["success"] is True
+    assert result["case_update"]["status_code"] == 204
+    assert result["case_update"]["error_message"] is None
+    assert result["case_update"]["response_payload"] == {}
 
 
 def test_post_single_candidate_case_patch_failure_does_not_change_outcome():
@@ -604,7 +665,7 @@ def test_build_post_log_insert_vip_candidate():
 
     assert row["is_vip"] is True
     assert row["policy_name"] == "VIP"
-    assert row["policy_api_value"] is None  # unconfirmed for VIP -- must never be guessed
+    assert row["policy_api_value"] == "Tier 2"  # confirmed 2026-08-24 temporary business rule
 
 
 def test_build_post_log_insert_includes_start_date_audit_fields():
@@ -627,6 +688,43 @@ def test_build_post_log_insert_includes_start_date_audit_fields():
     assert row["execution_date"] == EXECUTION_TIMESTAMP
     assert row["effective_start_date"] == datetime.date(2026, 11, 1)
     assert row["start_date_source"] == "CALCULATED"
+
+
+def test_build_post_log_insert_includes_http_status_code():
+    candidate = {"application_eid": "APP-1", "candidate_eid": "CAND-1", "email": "jane@example.com", "is_vip": False}
+    result = {
+        "outcome": "success",
+        "request_payload": {"firstName": "Jane"},
+        "response_payload": {"data": [{"benivoId": 1}]},
+        "error_message": None,
+        "benivo_user_id": 1,
+        "benivo_assignment_id": 2,
+        "benivo_profile_url": None,
+        "status_code": 200,
+    }
+
+    row = posting.build_post_log_insert("run-123", candidate, result)
+
+    assert row["http_status_code"] == 200
+
+
+def test_build_post_log_insert_http_status_code_none_when_absent():
+    # Predates this rule / no create-user HTTP call happened on this path
+    # (e.g. office-unresolved failure) -- must not KeyError.
+    candidate = {"application_eid": "APP-1", "candidate_eid": "CAND-1", "email": "jane@example.com", "is_vip": False}
+    result = {
+        "outcome": "failed",
+        "request_payload": None,
+        "response_payload": None,
+        "error_message": "no office",
+        "benivo_user_id": None,
+        "benivo_assignment_id": None,
+        "benivo_profile_url": None,
+    }
+
+    row = posting.build_post_log_insert("run-123", candidate, result)
+
+    assert row["http_status_code"] is None
 
 
 def test_build_post_log_insert_defaults_start_date_audit_fields_to_none_when_absent():
@@ -679,9 +777,13 @@ def test_build_case_update_post_log_insert_success():
         "attempted": True,
         "success": True,
         "case_id": 1010644,
-        "request_payload": {"caseId": 1010644, "hostJobRole": "Engineer", "homeLocation": {"country": "Serbia"}},
+        "request_payload": {
+            "findBy": {"caseId": 1010644},
+            "data": {"hostJobRole": "Engineer", "homeLocation": {"country": "Serbia"}},
+        },
         "response_payload": {"hasError": False},
         "error_message": None,
+        "status_code": 204,
     }
 
     row = posting.build_case_update_post_log_insert("run-123", candidate, case_update)
@@ -689,9 +791,10 @@ def test_build_case_update_post_log_insert_success():
     assert row["action"] == "UPDATE_CASE"
     assert row["status"] == "SUCCESS"
     assert row["benivo_assignment_id"] == 1010644
-    assert row["request_payload"]["hostJobRole"] == "Engineer"
+    assert row["request_payload"]["data"]["hostJobRole"] == "Engineer"
     assert row["policy_name"] is None  # no policy decision applies to a Case update
     assert row["policy_api_value"] is None
+    assert row["http_status_code"] == 204
 
 
 def test_build_case_update_post_log_insert_failure():
@@ -700,7 +803,7 @@ def test_build_case_update_post_log_insert_failure():
         "attempted": True,
         "success": False,
         "case_id": 1010644,
-        "request_payload": {"caseId": 1010644},
+        "request_payload": {"findBy": {"caseId": 1010644}, "data": {}},
         "response_payload": {"hasError": True},
         "error_message": "boom",
     }
@@ -735,6 +838,7 @@ def test_record_post_result_uses_one_transaction_for_both_writes():
         "benivo_user_id": 1,
         "benivo_assignment_id": 2,
         "benivo_profile_url": None,
+        "status_code": 200,
     }
 
     with patch("app.services.posting_service.transaction", return_value=FakeTransaction()) as mock_transaction:
@@ -747,6 +851,7 @@ def test_record_post_result_uses_one_transaction_for_both_writes():
     assert "INSERT INTO benivo.post_log" in insert_sql
     assert "posted_at" in insert_sql
     assert "processed_at" not in insert_sql
+    assert "http_status_code" in insert_sql
     assert insert_params[0] == "run-123"  # run_id
     assert insert_params[1] == "APP-1"  # application_eid
     assert insert_params[2] == "CAND-1"  # candidate_eid
@@ -756,6 +861,7 @@ def test_record_post_result_uses_one_transaction_for_both_writes():
     assert insert_params[6] is None  # is_vip (candidate has no is_vip key)
     assert insert_params[7] == "Basic"  # policy_name (None is_vip still resolves to Basic)
     assert insert_params[8] == "Tier 1"  # policy_api_value
+    assert insert_params[-1] == 200  # http_status_code -- last positional param before posted_at=NOW()
 
     update_sql, update_params = mock_cursor.execute.call_args_list[1][0]
     assert "UPDATE benivo.candidates" in update_sql
@@ -790,7 +896,10 @@ def test_record_post_result_writes_case_update_row_when_present():
             "attempted": True,
             "success": False,
             "case_id": 2,
-            "request_payload": {"caseId": 2, "hostJobRole": None, "homeLocation": {"country": None}},
+            "request_payload": {
+                "findBy": {"caseId": 2},
+                "data": {"hostJobRole": None, "homeLocation": {"country": None}},
+            },
             "response_payload": {"hasError": True},
             "error_message": "boom",
         },

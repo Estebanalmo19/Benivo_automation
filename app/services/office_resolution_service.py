@@ -33,6 +33,17 @@ WORKPLACE_TO_OFFICE_NAME = {
     # "Latvia (Global)" -> e908ab8d-0046-43f4-9ead-6a8dfb4b0876.
     "romania live casino": "Romania (Live Casino)",
     "latvia": "Latvia (Global)",
+    # Added 2026-08-24: traced application_eid=penv7zwh stuck in
+    # PENDING_OFFICE_MAPPING. Confirmed end-to-end -- not an inference from
+    # candidate address/country: application.job.customField[fieldCode=
+    # 'site'] is the literal, bare string "UAE" (not "RAK Live Casino"),
+    # so it never matched the existing "rak live casino" key. Confirmed
+    # live in current UAT refdata that "UAE (Live Casino)" exists
+    # (ca081aff-d1f3-407a-afdd-adb836563d31), distinct from "UAE (Global)"
+    # (1f607452-4bf2-4783-a3b5-40a923aced07) -- this maps the bare "UAE"
+    # workplace value to the Live Casino office specifically, per confirmed
+    # business intent, not the Global one.
+    "uae": "UAE (Live Casino)",
 }
 
 # Explicit, reviewed Benivo officeName -> hostCountry mapping. Confirmed

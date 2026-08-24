@@ -13,11 +13,15 @@ import requests
 
 from app import config
 
-TOKEN_URL = "https://externalapi.uat.benivo.com/idm/v1/Token/OAuth2"
-REFDATA_URL = "https://hubapi.uat.benivo.com/v3/api/user/refdata"
-CREATE_USER_URL = "https://hubapi.uat.benivo.com/v3/api/user/create"
-USER_ASSIGNMENT_URL = "https://hubapi.uat.benivo.com/v3/api/user/userassignment"
-CASE_URL = "https://externalapi.uat.benivo.com/clients/v1/Case"
+# No Benivo URL is ever hardcoded here -- every endpoint is environment-driven
+# (see app.config, which fails fast at startup via config.validate() if any
+# is missing) so switching the whole app from UAT to Production is only a
+# .env change, never a code change.
+TOKEN_URL = config.BENIVO_TOKEN_URL
+REFDATA_URL = config.BENIVO_REFDATA_URL
+CREATE_USER_URL = config.BENIVO_CREATE_USER_URL
+USER_ASSIGNMENT_URL = config.BENIVO_USER_LOOKUP_URL
+CASE_URL = config.BENIVO_CASE_URL
 
 REQUEST_TIMEOUT_SECONDS = 30
 
@@ -146,8 +150,23 @@ def update_case(access_token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     PATCH /clients/v1/Case. Confirmed 2026-08-10 by Gina (Benivo): the
     assignmentId from create-user IS the caseId this endpoint requires.
-    Caller sends only confirmed fields (caseId, hostJobRole,
-    homeLocation.country) -- see posting_service.build_case_update_payload().
+    Confirmed 2026-08-19 by Gina: the body must be a findBy/data envelope
+    ({"findBy": {"caseId": ...}, "data": {"hostJobRole": ..., "homeLocation":
+    {"country": ...}}}), not a flat body -- see
+    posting_service.build_case_update_payload(), which builds the exact
+    shape. This function sends payload as-is with no reshaping.
+
+    Fixed 2026-08-21 after a real UAT PATCH was misreported as FAILED with
+    an empty response body: this previously required response.status_code
+    to be exactly 200, rejecting every other 2xx (201/202/204/...) as a
+    failure even when transport succeeded and Benivo returned no error --
+    e.g. 204 No Content, a normal, bodyless PATCH-success convention, was
+    treated identically to a real server error. Any 2xx is now transport
+    success unless the response body explicitly says hasError=true.
+    status_code is always the real HTTP status Benivo returned, so a
+    genuine failure (4xx/5xx) is never confused with the 204-no-body case
+    -- both share raw_response={} but are distinguished by status_code and
+    success.
     """
     response = requests.patch(
         CASE_URL,
@@ -156,11 +175,12 @@ def update_case(access_token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
+    status_code = response.status_code
     body = response.json() if response.content else {}
 
-    result = {"success": False, "status_code": response.status_code, "raw_response": body, "error": None}
+    result = {"success": False, "status_code": status_code, "raw_response": body, "error": None}
 
-    if response.status_code != 200 or body.get("hasError") is True:
+    if not (200 <= status_code < 300) or body.get("hasError") is True:
         result["error"] = json.dumps(body, ensure_ascii=False)
         return result
 

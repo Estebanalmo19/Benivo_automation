@@ -154,6 +154,17 @@ integration is **implemented**:
 - Only these confirmed fields are sent on the Case PATCH (`caseId`,
   `hostJobRole`, `homeLocation.country`) -- no other Case field has been
   confirmed, so none is guessed.
+- Confirmed 2026-08-19 by Gina after a real UAT PATCH returned error 999:
+  the endpoint requires a `findBy`/`data` envelope, not a flat body --
+  `{"findBy": {"caseId": ...}, "data": {"hostJobRole": ..., "homeLocation":
+  {"country": ...}}}`. A flat `{"caseId": ..., "hostJobRole": ..., ...}`
+  body is what caused the 999.
+- Confirmed 2026-08-21 by a real Benivo UAT PATCH: `homeLocation.country`
+  must be a 2-character ISO 3166-1 alpha-2 code (e.g. `"RS"`), not the full
+  country name -- a full name causes error 4422. See
+  `app/services/country_code_service.py` (`resolve_iso2()`), used ONLY for
+  this field. `create-user`'s `homeCountry` has no evidence of the same
+  requirement and is deliberately left sending the full name as-is.
 - The Case PATCH is called immediately after a **successful** create-user
   (see `posting_service.post_single_candidate()`), never for
   `already_exists` or `failed` outcomes.
@@ -161,6 +172,106 @@ integration is **implemented**:
   recorded as its own `benivo.post_log` row (`action = 'UPDATE_CASE'`,
   see `migrations/0006`) and never changes the candidate's `POSTED` status
   set by a successful create-user.
+
+---
+
+## Benivo API endpoint configuration (UAT vs Production)
+
+Confirmed 2026-08-21: every Benivo HTTP endpoint is environment-driven --
+`app/clients/benivo_client.py` never hardcodes a URL, it reads
+`config.BENIVO_TOKEN_URL` / `BENIVO_REFDATA_URL` / `BENIVO_CREATE_USER_URL` /
+`BENIVO_USER_LOOKUP_URL` / `BENIVO_CASE_URL` exclusively. These five are
+`REQUIRED_SETTINGS` in `app/config.py`, so `config.validate()` fails fast
+and clearly at startup (used by `app/main.py` and every `scripts/*.py`
+entrypoint) if any is missing -- see `.env.example` for the current
+confirmed UAT values.
+
+**Switching the whole app from UAT to Production is meant to be ONLY a
+`.env` change** (these five URLs plus `BENIVO_CLIENT_ID`/`BENIVO_CLIENT_SECRET`)
+-- no Python source code should need to change.
+
+Production endpoint values are **not yet confirmed** as of 2026-08-21. Do
+not guess them -- get them confirmed by Benivo (their GitBook, once
+available, or a direct confirmation email the same way the UAT endpoints
+were confirmed) before ever setting them in a production `.env`.
+
+---
+
+## Go-Live design: excluding the pre-existing backlog from automatic posting
+
+Business requirement (2026-08-21): when Production goes live, the existing
+`READY_TO_POST` backlog must **not** be automatically posted. Only
+candidates the automation detects entering the Benivo posting scope
+**after** go-live should be auto-posted. "New" is defined strictly as
+"first time this automation ever saw the application inside scope"
+(`workflow_state = 'Mobility in process'` + a recognized
+`is_relocation_required` value) -- explicitly **not** the Jobvite
+application/candidate creation date, since candidates can apply months
+before entering Mobility. The design must also survive a candidate leaving
+Mobility and re-entering later.
+
+**Why not a column on `benivo.candidates`:** `synchronization_service.
+_DELETE_OUT_OF_SCOPE_SQL` permanently deletes a candidate's row the moment
+they leave scope. A `first_seen_at` column on that row would be lost the
+instant the candidate leaves and re-enters, incorrectly making a
+pre-existing candidate look brand new.
+
+**Design: a separate, append-only `benivo.scope_history` table**
+(`migrations/0008_add_scope_history_table.sql`, not yet applied):
+
+```sql
+CREATE TABLE benivo.scope_history (
+    application_eid TEXT PRIMARY KEY,
+    candidate_eid TEXT,
+    first_seen_in_scope_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+- `synchronization_service.sync_candidates()` inserts into this table with
+  `ON CONFLICT (application_eid) DO NOTHING`, using the exact same scope
+  predicate as its own upsert/delete SQL, in the same transaction, before
+  the out-of-scope delete runs. An application_eid gets exactly one
+  `first_seen_in_scope_at`, ever -- durable across any number of scope
+  exits/re-entries.
+- `candidate_repository.get_ready_candidates()` gates automatic selection:
+  when `config.go_live_at()` is set, a candidate is only auto-selected if
+  `scope_history.first_seen_in_scope_at >= go_live_at`. A candidate with no
+  `scope_history` row at all is conservatively excluded (never auto-posted
+  on unproven "new" status). **`benivo_status` is completely untouched by
+  this** -- a backlog candidate stays visibly `READY_TO_POST` everywhere
+  (DB, reports, UAT override), just excluded from automatic selection.
+  While `BENIVO_GO_LIVE_AT` is unset, this adds no filtering at all
+  (today's exact behavior).
+
+**Baseline procedure required before enabling production go-live** (see
+`scripts/backfill_scope_history.py`), in order:
+
+1. Apply `migrations/0008_add_scope_history_table.sql`.
+2. Run `python scripts/backfill_scope_history.py --check`, review the
+   counts, then `--apply`. This inserts one row per application_eid known
+   from `benivo.candidates` (current backlog) **UNION** `benivo.post_log`
+   (every application_eid ever attempted, including ones whose
+   `candidates` row has since been deleted after leaving scope), with
+   `first_seen_in_scope_at = NOW()` -- guaranteed before go-live since the
+   cutover isn't enabled yet. Safe to re-run (`ON CONFLICT DO NOTHING`).
+   **Known limitation:** a candidate who fully entered and left scope
+   before ever being posted and before this backfill ran has no trace in
+   either source table and cannot be backfilled; run this as close to the
+   actual cutover as practical to minimize that window.
+3. Only then deploy the code that reads/writes `scope_history`
+   (`synchronization_service.py`, `candidate_repository.py`,
+   `reporting_service.py`) -- deploying it before step 1 makes
+   `sync_candidates()` fail on every run (INSERT into a table that doesn't
+   exist yet).
+4. Only then set `BENIVO_GO_LIVE_AT` (ISO 8601, e.g.
+   `2026-09-01T00:00:00Z`) to actually activate the gate.
+
+**Reporting:** the "Go-Live Status" sheet and the Executive Summary's
+"Go-Live Readiness" section (see `app/services/reporting_service.py`)
+classify every in-scope candidate into one of four mutually exclusive,
+report-only categories (never written back to `benivo_status`):
+`Pre-Go-Live Backlog`, `Newly Eligible`, `Automatically Eligible` (exactly
+who `get_ready_candidates()` will pick up next run), `Already Posted`.
 
 ---
 

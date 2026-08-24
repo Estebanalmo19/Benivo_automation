@@ -1,4 +1,11 @@
-"""Centralized policy resolution: is_vip -> policy_name -> policy_api_value. is_vip is the only input."""
+"""Centralized policy resolution: is_vip -> policy_name -> policy_api_value. is_vip is the only input.
+
+This module is the ONE place the mobility_vip -> Benivo policy tier
+business rule lives -- every consumer (Create User payload, Payload
+Preview, Ready To Post, Executive Summary) calls resolve_policy_values()
+or resolve_policy()/resolve_policy_api_value() rather than re-deriving a
+tier from is_vip itself.
+"""
 
 from typing import Optional, Tuple
 
@@ -11,11 +18,11 @@ def resolve_policy(is_vip: Optional[bool]) -> str:
       is_vip IS TRUE       -> 'VIP'
       is_vip IS FALSE/NULL -> 'Basic'
 
-    Deliberately does not consider job_title, department, salary, office, or
-    the old unconfirmed candidates.vip text field -- is_vip is the only
-    input. VIP has no confirmed Jobvite source yet (see
-    synchronization_service), so is_vip is business/integration-owned and
-    defaults to FALSE.
+    Deliberately does not consider job_title, department, salary, or office
+    -- is_vip is the only input. Confirmed 2026-08-24: is_vip is now
+    source-owned, synced every run from Jobvite's application.customField
+    [fieldCode='mobility_vip'] ("Yes"/"No") -- see
+    synchronization_service.py's _UPSERT_SQL.
     """
     return POLICY_VIP if is_vip is True else POLICY_BASIC
 
@@ -34,11 +41,17 @@ def resolve_policy(is_vip: Optional[bool]) -> str:
 # Confirmed live in UAT on 2026-07-30: candidate pCu0IxwQ retried with
 # policy="Tier 1" returned SUCCESS (benivo_user_id=605070).
 #
-# No confirmed Benivo API value exists for VIP anywhere (not in refdata, not
-# in any historical payload) -- deliberately left unmapped so VIP candidates
-# are blocked from posting (via payload validation) rather than guessed.
+# VIP -> "Tier 2": a TEMPORARY business rule confirmed 2026-08-24, pending
+# Mobility defining anything more specific ("mobility_vip == 'Yes' ->
+# Policy = Tier 2, otherwise -> Tier 1"). Before this, no confirmed Benivo
+# API value existed for VIP anywhere, so it was deliberately left unmapped
+# (None) to block VIP candidates from posting rather than guess. This is
+# no longer a guess -- it's this rule -- so VIP candidates are no longer
+# blocked at posting time (see posting_service._validate_payload(), which
+# rejects only a None policy value).
 POLICY_NAME_TO_API_VALUE = {
     POLICY_BASIC: "Tier 1",
+    POLICY_VIP: "Tier 2",
 }
 
 

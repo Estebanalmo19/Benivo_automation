@@ -110,6 +110,48 @@ def test_pct_returns_na_for_zero_denominator():
     assert reporting._pct(0, 0) == "N/A"
 
 
+# ---------------------------------------------------------------------------
+# _go_live_category() -- pure go-live classification, independent of benivo_status storage
+# ---------------------------------------------------------------------------
+
+GO_LIVE_AT = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)
+BEFORE_GO_LIVE = datetime.datetime(2026, 8, 1, tzinfo=datetime.timezone.utc)
+AFTER_GO_LIVE = datetime.datetime(2026, 9, 15, tzinfo=datetime.timezone.utc)
+
+
+def test_go_live_category_already_posted_regardless_of_timing():
+    assert reporting._go_live_category("POSTED", AFTER_GO_LIVE, GO_LIVE_AT) == reporting.GO_LIVE_ALREADY_POSTED
+    assert reporting._go_live_category("POSTED", None, GO_LIVE_AT) == reporting.GO_LIVE_ALREADY_POSTED
+
+
+def test_go_live_category_backlog_when_go_live_not_configured():
+    assert reporting._go_live_category("READY_TO_POST", AFTER_GO_LIVE, None) == reporting.GO_LIVE_PRE_GO_LIVE_BACKLOG
+
+
+def test_go_live_category_backlog_when_first_seen_before_cutover():
+    assert reporting._go_live_category("READY_TO_POST", BEFORE_GO_LIVE, GO_LIVE_AT) == reporting.GO_LIVE_PRE_GO_LIVE_BACKLOG
+
+
+def test_go_live_category_backlog_when_no_scope_history_row_at_all():
+    # Conservative default: never treat "unknown" as "new" -- matches
+    # candidate_repository.get_ready_candidates()'s own EXISTS-based filter.
+    assert reporting._go_live_category("READY_TO_POST", None, GO_LIVE_AT) == reporting.GO_LIVE_PRE_GO_LIVE_BACKLOG
+
+
+def test_go_live_category_automatically_eligible_when_new_and_ready():
+    assert (
+        reporting._go_live_category("READY_TO_POST", AFTER_GO_LIVE, GO_LIVE_AT)
+        == reporting.GO_LIVE_AUTOMATICALLY_ELIGIBLE
+    )
+
+
+def test_go_live_category_newly_eligible_when_new_but_not_ready():
+    assert (
+        reporting._go_live_category("PENDING_OFFICE_MAPPING", AFTER_GO_LIVE, GO_LIVE_AT)
+        == reporting.GO_LIVE_NEWLY_ELIGIBLE
+    )
+
+
 def test_build_row_has_all_required_columns():
     row = reporting._build_row(_candidate("APP-1"), "some reason", EXECUTION_TIMESTAMP)
     assert set(row.keys()) == set(reporting.REQUIRED_COLUMNS)
@@ -159,6 +201,17 @@ def test_build_ready_to_post_row_uses_business_policy_label():
 
     assert row_basic["Policy"] == "Basic"
     assert row_vip["Policy"] == "VIP"
+
+
+def test_build_ready_to_post_row_mobility_vip_and_tier_columns():
+    row_basic = reporting._build_ready_to_post_row(_complete_candidate(is_vip=False), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True)
+    row_vip = reporting._build_ready_to_post_row(_complete_candidate(is_vip=True), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True)
+
+    assert row_basic["Mobility VIP"] == "No"
+    assert row_basic["Policy (Tier)"] == "Tier 1"
+
+    assert row_vip["Mobility VIP"] == "Yes"
+    assert row_vip["Policy (Tier)"] == "Tier 2"
 
 
 def test_build_ready_to_post_row_reflects_passed_in_payload_ready():
@@ -213,7 +266,8 @@ def test_build_payload_preview_row_case_id_pending_when_not_yet_posted():
 
     assert row["case_caseId_available"] == "PENDING_CREATE_USER"
     assert row["case_hostJobRole"] == "Game Presenter"
-    assert row["case_homeLocation_country"] == "Serbia"
+    assert row["case_home_country"] == "Serbia"
+    assert row["case_home_country_iso"] == "RS"
 
 
 def test_build_payload_preview_row_case_id_shown_when_already_posted():
@@ -221,6 +275,22 @@ def test_build_payload_preview_row_case_id_shown_when_already_posted():
     row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
 
     assert row["case_caseId_available"] == 1010696
+
+
+def test_build_payload_preview_row_mobility_vip_and_population_basic():
+    candidate = _complete_candidate(is_vip=False)
+    row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
+
+    assert row["mobility_vip"] == "No"
+    assert row["create_policy"] == "Tier 1"
+
+
+def test_build_payload_preview_row_mobility_vip_and_population_vip():
+    candidate = _complete_candidate(is_vip=True)
+    row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
+
+    assert row["mobility_vip"] == "Yes"
+    assert row["create_policy"] == "Tier 2"
 
 
 def test_build_payload_preview_row_fully_ready_when_complete():
@@ -274,15 +344,16 @@ def test_build_payload_preview_row_unresolved_office_blocks_create_user_readines
     assert row["payload_ready"] is False
 
 
-def test_build_payload_preview_row_vip_invalid_policy_blocks_create_user_readiness():
-    # No confirmed Benivo API value exists for VIP -- see policy_service.py.
+def test_build_payload_preview_row_vip_resolves_to_tier_2_and_is_ready():
+    # Confirmed 2026-08-24: VIP now resolves to a confirmed Benivo policy
+    # tier ("Tier 2"), so it no longer blocks readiness -- see policy_service.py.
     candidate = _complete_candidate(is_vip=True)
     row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
 
-    assert row["invalid_policy"] is True
-    assert row["create_policy"] is None
-    assert row["ready_to_create_user"] is False
-    assert row["payload_ready"] is False
+    assert row["invalid_policy"] is False
+    assert row["create_policy"] == "Tier 2"
+    assert row["ready_to_create_user"] is True
+    assert row["payload_ready"] is True
 
 
 def test_build_payload_preview_row_has_terminal_create_user_result_reflects_terminal_eids():
@@ -397,12 +468,14 @@ def _mock_population():
     ]
 
 
-def _patch_common(monkeypatch, tmp_path, population, post_log_rows=None):
+def _patch_common(monkeypatch, tmp_path, population, post_log_rows=None, scope_history=None, go_live_at=None):
     monkeypatch.setattr(reporting, "_report_dir", lambda: tmp_path)
     monkeypatch.setattr(reporting.candidate_repository, "get_all_candidates_for_report", lambda: population)
+    monkeypatch.setattr(reporting.candidate_repository, "get_scope_history_map", lambda: scope_history or {})
     monkeypatch.setattr(reporting.post_log_repository, "get_terminal_post_log_application_eids", lambda: set())
     monkeypatch.setattr(reporting.post_log_repository, "get_post_log_rows_for_run", lambda run_id: post_log_rows or [])
     monkeypatch.setattr(reporting.posting_service, "allow_reference_data_calls", lambda: False)
+    monkeypatch.setattr(reporting.config, "go_live_at", lambda: go_live_at)
 
 
 def test_generate_reports_produces_expected_sheet_names(tmp_path, monkeypatch):
@@ -412,15 +485,71 @@ def test_generate_reports_produces_expected_sheet_names(tmp_path, monkeypatch):
 
     wb = load_workbook(report_path)
     assert set(wb.sheetnames) == {
-        "Executive Summary", "Ready To Post", "Posting Results",
+        "Instructions", "Executive Summary", "Ready To Post", "Posting Results",
         "Pending Office Mapping", "Pending Recruiter Review", "Country Data Issues", "Payload Preview",
+        "Go-Live Status",
     }
+    assert wb.sheetnames[0] == "Instructions"
+    assert wb.sheetnames[1] == "Executive Summary"
     # Jobvite Start Date / Calculated Start Date / Unresolved Start Date /
     # Relocation Field Review / Missing Office Mapping / Summary must be gone.
     assert "Jobvite Start Date" not in wb.sheetnames
     assert "Calculated Start Date" not in wb.sheetnames
     assert "Unresolved Start Date" not in wb.sheetnames
     assert "Summary" not in wb.sheetnames
+
+
+def test_generate_reports_go_live_status_sheet_covers_all_four_categories(tmp_path, monkeypatch):
+    population = [
+        _candidate("BACKLOG-1", benivo_status="READY_TO_POST"),  # no scope_history row at all -> backlog
+        _candidate("NEW-READY-1", benivo_status="READY_TO_POST"),
+        _candidate("NEW-NOT-READY-1", benivo_status="PENDING_OFFICE_MAPPING"),
+        _candidate("POSTED-1", benivo_status="POSTED"),
+    ]
+    scope_history = {
+        "NEW-READY-1": AFTER_GO_LIVE,
+        "NEW-NOT-READY-1": AFTER_GO_LIVE,
+        "POSTED-1": BEFORE_GO_LIVE,
+    }
+    _patch_common(monkeypatch, tmp_path, population, scope_history=scope_history, go_live_at=GO_LIVE_AT)
+
+    report_path, metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    ws = wb["Go-Live Status"]
+    header = [c.value for c in ws[2]]
+    rows_by_eid = {
+        row[header.index("application_eid")]: dict(zip(header, row))
+        for row in ws.iter_rows(min_row=3, values_only=True)
+    }
+
+    assert rows_by_eid["BACKLOG-1"]["go_live_category"] == reporting.GO_LIVE_PRE_GO_LIVE_BACKLOG
+    assert rows_by_eid["NEW-READY-1"]["go_live_category"] == reporting.GO_LIVE_AUTOMATICALLY_ELIGIBLE
+    assert rows_by_eid["NEW-NOT-READY-1"]["go_live_category"] == reporting.GO_LIVE_NEWLY_ELIGIBLE
+    assert rows_by_eid["POSTED-1"]["go_live_category"] == reporting.GO_LIVE_ALREADY_POSTED
+
+    assert metrics["go_live_pre_backlog"] == 1
+    assert metrics["go_live_automatically_eligible"] == 1
+    assert metrics["go_live_newly_eligible"] == 1
+    assert metrics["go_live_already_posted"] == 1
+
+
+def test_generate_reports_go_live_status_all_backlog_when_not_configured(tmp_path, monkeypatch):
+    # go_live_at unset -- identical to pre-go-live behavior, nothing is
+    # ever "new" until the cutover is deliberately configured.
+    population = [_candidate("APP-1", benivo_status="READY_TO_POST")]
+    _patch_common(monkeypatch, tmp_path, population, scope_history={"APP-1": AFTER_GO_LIVE}, go_live_at=None)
+
+    report_path, metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    ws = wb["Go-Live Status"]
+    header = [c.value for c in ws[2]]
+    row = dict(zip(header, next(ws.iter_rows(min_row=3, values_only=True))))
+
+    assert row["go_live_category"] == reporting.GO_LIVE_PRE_GO_LIVE_BACKLOG
+    assert metrics["go_live_pre_backlog"] == 1
+    assert metrics["go_live_automatically_eligible"] == 0
 
 
 def test_generate_reports_ready_to_post_and_payload_preview_agree_on_readiness(tmp_path, monkeypatch):
@@ -431,14 +560,14 @@ def test_generate_reports_ready_to_post_and_payload_preview_agree_on_readiness(t
     wb = load_workbook(report_path)
 
     ready_ws = wb["Ready To Post"]
-    ready_header = [c.value for c in ready_ws[1]]
+    ready_header = [c.value for c in ready_ws[2]]
     assert ready_header == reporting.READY_TO_POST_COLUMNS
-    ready_rows = {row[0]: dict(zip(ready_header, row)) for row in ready_ws.iter_rows(min_row=2, values_only=True)}
+    ready_rows = {row[0]: dict(zip(ready_header, row)) for row in ready_ws.iter_rows(min_row=3, values_only=True)}
 
     preview_ws = wb["Payload Preview"]
-    preview_header = [c.value for c in preview_ws[1]]
+    preview_header = [c.value for c in preview_ws[2]]
     assert preview_header == reporting.PAYLOAD_PREVIEW_COLUMNS
-    preview_rows = {row[0]: dict(zip(preview_header, row)) for row in preview_ws.iter_rows(min_row=2, values_only=True)}
+    preview_rows = {row[0]: dict(zip(preview_header, row)) for row in preview_ws.iter_rows(min_row=3, values_only=True)}
 
     assert set(ready_rows.keys()) == {"READY-1", "CALC-1"}
     assert set(preview_rows.keys()) == {"READY-1", "CALC-1"}
@@ -464,10 +593,10 @@ def test_generate_reports_country_data_issues_sheet_includes_missing_and_fallbac
 
     wb = load_workbook(report_path)
     ws = wb["Country Data Issues"]
-    header = [c.value for c in ws[1]]
+    header = [c.value for c in ws[2]]
     assert header == reporting.COUNTRY_DATA_ISSUES_COLUMNS
 
-    rows = {row[0]: dict(zip(header, row)) for row in ws.iter_rows(min_row=2, values_only=True)}
+    rows = {row[0]: dict(zip(header, row)) for row in ws.iter_rows(min_row=3, values_only=True)}
 
     # Only the missing and fallback-using candidates appear -- the one with
     # a primary candidate_home_country is fully clean, not an "issue".
@@ -536,9 +665,9 @@ def test_generate_reports_exception_sheets_present_when_nonempty(tmp_path, monke
     assert "Pending Office Mapping" in wb.sheetnames
     assert "Pending Recruiter Review" in wb.sheetnames
     assert "Country Data Issues" in wb.sheetnames
-    assert wb["Pending Office Mapping"].max_row >= 2
-    assert wb["Pending Recruiter Review"].max_row >= 2
-    assert wb["Country Data Issues"].max_row >= 2
+    assert wb["Pending Office Mapping"].max_row >= 3
+    assert wb["Pending Recruiter Review"].max_row >= 3
+    assert wb["Country Data Issues"].max_row >= 3
 
 
 def test_generate_reports_ready_to_post_includes_country_columns(tmp_path, monkeypatch):
@@ -549,8 +678,8 @@ def test_generate_reports_ready_to_post_includes_country_columns(tmp_path, monke
 
     wb = load_workbook(report_path)
     ws = wb["Ready To Post"]
-    header = [c.value for c in ws[1]]
-    row = dict(zip(header, next(ws.iter_rows(min_row=2, values_only=True))))
+    header = [c.value for c in ws[2]]
+    row = dict(zip(header, next(ws.iter_rows(min_row=3, values_only=True))))
 
     assert row["Candidate Home Country"] is None
     assert row["Current Country"] == "Belarus"
@@ -566,15 +695,16 @@ def test_generate_reports_payload_preview_shows_home_country_source_and_uses_fal
 
     wb = load_workbook(report_path)
     ws = wb["Payload Preview"]
-    header = [c.value for c in ws[1]]
-    row = dict(zip(header, next(ws.iter_rows(min_row=2, values_only=True))))
+    header = [c.value for c in ws[2]]
+    row = dict(zip(header, next(ws.iter_rows(min_row=3, values_only=True))))
 
     assert row["home_country"] is None
     assert row["current_country"] == "Belarus"
     assert row["home_country_source"] == "CURRENT_LOCATION"
     # The actual payload preview fields must carry the EFFECTIVE (fallback) value.
     assert row["create_homeCountry"] == "Belarus"
-    assert row["case_homeLocation_country"] == "Belarus"
+    assert row["case_home_country"] == "Belarus"
+    assert row["case_home_country_iso"] == "BY"
     # missing_home_country now reflects the effective value, not just the primary.
     assert row["missing_home_country"] is False
 
@@ -593,10 +723,10 @@ def test_generate_reports_posting_results_built_from_post_log_not_memory(tmp_pat
 
     wb = load_workbook(report_path)
     ws = wb["Posting Results"]
-    header = [c.value for c in ws[1]]
+    header = [c.value for c in ws[2]]
     assert header == reporting.POSTING_RESULTS_COLUMNS
 
-    rows = list(ws.iter_rows(min_row=2, values_only=True))
+    rows = list(ws.iter_rows(min_row=3, values_only=True))
     assert len(rows) == 1
     row = dict(zip(header, rows[0]))
     assert row["Application EID"] == "APP-1"
@@ -616,7 +746,7 @@ def test_generate_reports_posting_results_empty_on_dry_run(tmp_path, monkeypatch
     report_path, _metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
 
     wb = load_workbook(report_path)
-    assert wb["Posting Results"]["A1"].value == reporting.DRY_RUN_NOTE
+    assert wb["Posting Results"]["A2"].value == reporting.DRY_RUN_NOTE
 
 
 def test_generate_reports_sync_metrics_shown_when_provided(tmp_path, monkeypatch):
@@ -658,6 +788,26 @@ def test_generate_reports_executive_summary_has_data_quality_section(tmp_path, m
     assert "Ready To Create User (Ready To Post)" in labels
     assert "Ready To Update Case (Ready To Post)" in labels
     assert "Fully Payload Ready (Ready To Post)" in labels
+
+
+def test_generate_reports_mobility_vip_distribution_counts_tier_1_and_tier_2(tmp_path, monkeypatch):
+    population = [
+        _candidate("BASIC-1", is_vip=False, benivo_status="READY_TO_POST"),
+        _candidate("BASIC-2", is_vip=False, benivo_status="READY_TO_POST"),
+        _candidate("VIP-1", is_vip=True, benivo_status="READY_TO_POST"),
+    ]
+    _patch_common(monkeypatch, tmp_path, population)
+
+    report_path, metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    rows = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
+
+    assert "Mobility VIP Distribution" in rows
+    assert rows["Tier 1"] == "2 (66.7%)"
+    assert rows["Tier 2"] == "1 (33.3%)"
+    assert metrics["mobility_vip_tier_1"] == 2
+    assert metrics["mobility_vip_tier_2"] == 1
 
 
 def test_generate_reports_selected_count_never_exceeds_limit(tmp_path, monkeypatch):
