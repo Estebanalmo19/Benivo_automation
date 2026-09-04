@@ -7,28 +7,70 @@ from app import config
 from app.clients.database_client import db_cursor
 from app.models.domain import ACTION_CREATE_USER, TERMINAL_POST_LOG_STATUSES
 
-READY_CANDIDATE_FIELDS = """
+# Jobvite raw_payload is the authoritative source for both subqueries below
+# (confirmed with Mobility 2026-09-04) -- both join
+# jv_arrise_data_schema.jobvite_applications by application_eid, an EXACT
+# key match already relied upon everywhere else in this codebase. No email
+# join and no hibob_etl.employees dependency (retired -- see
+# population_service.py's module docstring for why hr_work_title/HiBob is
+# no longer used).
+#
+# dealer__shuffler (double underscore -- confirmed 2026-09-04 by querying
+# real data; NOT "dealer_shuffler" as originally described) lives at JOB
+# level (application.job.customField), the exact same path `workplace` is
+# synced from (fieldCode='site') below -- NOT application level, where a
+# same-named fieldCode also technically exists but has only 3 rows total,
+# none in the Mobility workflow (confirmed noise, not the real field).
+# Real values found job-wide: "Presenter", "Dealer", "Shuffler", "Gameshow
+# host", "n/a", "Prive Specialist Dealer" -- see population_service.py for
+# which of these the confirmed rule actually matches.
+DEALER_SHUFFLER_SUBQUERY = """(
+        SELECT job_cf->>'value'
+        FROM jv_arrise_data_schema.jobvite_applications j
+        CROSS JOIN LATERAL jsonb_array_elements(j.raw_payload->'application'->'job'->'customField') job_cf
+        WHERE j.application_eid = c.application_eid AND job_cf->>'fieldCode' = 'dealer__shuffler'
+        LIMIT 1
+    ) AS dealer_shuffler"""
+
+# mobility_support is application-level (application.customField), the same
+# path is_relocation_required/mobility_vip are read from. See
+# mobility_scope_service.py for how the multi-select value is parsed.
+MOBILITY_SUPPORT_SUBQUERY = """(
+        SELECT cf->>'value'
+        FROM jv_arrise_data_schema.jobvite_applications j
+        CROSS JOIN LATERAL jsonb_array_elements(j.raw_payload->'application'->'customField') cf
+        WHERE j.application_eid = c.application_eid AND cf->>'fieldCode' = 'mobility_support'
+        LIMIT 1
+    ) AS mobility_support"""
+
+READY_CANDIDATE_FIELDS = f"""
     c.id, c.application_eid, c.candidate_eid, c.email, c.first_name, c.last_name,
     c.job_title, c.requisition_id, c.workplace, c.host_country, c.host_city,
     c.start_date, c.benivo_status, c.created_at, c.updated_at,
     c.phone_number, c.location, c.population, c.vip, c.is_vip, c.gender,
     c.home_country, c.home_state_province, c.home_city, c.country_of_birth,
     c.citizenship, c.employee_id, c.billing_entity, c.host_legal_entity,
-    c.host_business_unit, c.current_country
+    c.host_business_unit, c.current_country,
+    {DEALER_SHUFFLER_SUBQUERY}
 """
 
-REPORTING_FIELDS = """
+REPORTING_FIELDS = f"""
     c.id, c.application_eid, c.candidate_eid, c.email, c.first_name, c.last_name,
     c.job_title, c.requisition_id, c.workplace, c.host_country, c.host_city,
-    c.start_date, c.benivo_status, c.created_at, c.updated_at
+    c.start_date, c.benivo_status, c.created_at, c.updated_at,
+    c.is_vip, c.home_country, c.current_country,
+    {DEALER_SHUFFLER_SUBQUERY},
+    {MOBILITY_SUPPORT_SUBQUERY}
 """
 
-FULL_REPORT_FIELDS = """
+FULL_REPORT_FIELDS = f"""
     c.id, c.application_eid, c.candidate_eid, c.email, c.first_name, c.last_name,
     c.workflow_state, c.is_relocation_required, c.start_date, c.workplace,
     c.job_title, c.requisition_id, c.department, c.location, c.benivo_status,
     c.is_vip, c.home_country, c.home_city, c.phone_number, c.benivo_assignment_id,
-    c.current_country, c.created_at, c.updated_at
+    c.current_country, c.created_at, c.updated_at,
+    {DEALER_SHUFFLER_SUBQUERY},
+    {MOBILITY_SUPPORT_SUBQUERY}
 """
 
 

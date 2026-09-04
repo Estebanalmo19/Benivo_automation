@@ -187,7 +187,7 @@ def test_dry_run_with_reference_data_enabled_fetches_refdata_but_never_creates_u
     assert results[0]["payload"]["officeName"] == "Serbia (Live Casino)"
 
 
-def test_dry_run_preview_includes_policy_name(monkeypatch):
+def test_dry_run_preview_includes_population_name(monkeypatch):
     monkeypatch.delenv("BENIVO_ALLOW_REFERENCE_DATA_CALLS", raising=False)
     candidates = [{"application_eid": "APP-1", "email": "jane@example.com", "first_name": "Jane", "last_name": "Doe", "workplace": "Serbia Live Casino", "start_date": None, "is_vip": False}]
 
@@ -196,10 +196,11 @@ def test_dry_run_preview_includes_policy_name(monkeypatch):
 
     mock_post.assert_not_called()
     mock_get.assert_not_called()
-    assert results[0]["policy_name"] == "Basic"
-    assert results[0]["policy_api_value"] == "Tier 1"
+    # No dealer_shuffler -> not a Game Presenter/Shuffler; is_vip False -> Tier 3.
+    assert results[0]["population_name"] == "Tier 3"
+    assert results[0]["population_api_value"] == "Tier 3"
     assert results[0]["is_vip"] is False
-    assert results[0]["payload"]["policy"] == "Tier 1"
+    assert results[0]["payload"]["policy"] == "Tier 3"
 
 
 def test_dry_run_preview_includes_home_country_and_case_update_payload(monkeypatch):
@@ -301,28 +302,80 @@ def test_post_candidates_generates_execution_timestamp_once_per_run(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# build_benivo_payload() -- policy_api_value, never the business label
+# build_benivo_payload() -- population_api_value, never a fabricated label
 # ---------------------------------------------------------------------------
 
-def test_build_benivo_payload_sends_policy_api_value_not_business_label():
-    # payload["policy"] must be the exact Benivo API value ("Tier 1"), never
-    # the business label "Basic" -- that literal string is what got the
-    # first real UAT attempt rejected ("Policy is misspelled").
-    candidate_basic = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False, "start_date": None}
+def test_build_benivo_payload_non_vip_non_gp_shuffler_sends_tier_3():
+    # Confirmed 2026-09-04 business rule: no Game Presenter/Shuffler
+    # dealer_shuffler value and mobility_vip != Yes -> Population "Tier 3".
+    candidate = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False, "start_date": None}
     office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
 
-    assert posting.build_benivo_payload(candidate_basic, office, datetime.date(2026, 1, 1))["policy"] == "Tier 1"
+    assert posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))["policy"] == "Tier 3"
 
 
-def test_build_benivo_payload_vip_resolves_to_tier_2_and_validates():
-    # Confirmed 2026-08-24 (temporary business rule): mobility_vip == "Yes"
-    # -> is_vip True -> policy = "Tier 2", no longer blocked from posting.
+def test_build_benivo_payload_vip_non_gp_shuffler_resolves_to_tier_1_and_validates():
+    # Confirmed 2026-09-04 business rule: no Game Presenter/Shuffler
+    # dealer_shuffler value and mobility_vip == Yes -> Population "Tier 1".
     candidate_vip = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": True, "start_date": None}
     office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
 
     payload = posting.build_benivo_payload(candidate_vip, office, datetime.date(2026, 1, 1))
-    assert payload["policy"] == "Tier 2"
+    assert payload["policy"] == "Tier 1"
     assert posting._validate_payload(payload) is True
+
+
+def test_build_benivo_payload_presenter_overrides_vip_status():
+    # Confirmed 2026-09-04 business rule: Game Presenter/Shuffler wins
+    # regardless of is_vip -- role is checked first.
+    candidate = {
+        "first_name": "Jane", "last_name": "Doe", "email": "j@example.com",
+        "is_vip": True, "start_date": None, "dealer_shuffler": "Presenter",
+    }
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+    assert payload["policy"] == "Game Presenters and Shufflers"
+
+
+def test_build_benivo_payload_shuffler_sends_gp_and_shufflers():
+    candidate = {
+        "first_name": "Jane", "last_name": "Doe", "email": "j@example.com",
+        "is_vip": False, "start_date": None, "dealer_shuffler": "Shuffler",
+    }
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+    assert payload["policy"] == "Game Presenters and Shufflers"
+
+
+def test_build_benivo_payload_dealer_is_gp_and_shufflers():
+    # Confirmed 2026-09-04 (second round): dealer_shuffler is a controlled
+    # selector -- "Dealer" IS a real catalog value and now counts as Game
+    # Presenters and Shufflers, regardless of is_vip. Retired the narrower
+    # Presenter/Shuffler-only allowlist from the first round.
+    candidate = {
+        "first_name": "Jane", "last_name": "Doe", "email": "j@example.com",
+        "is_vip": True, "start_date": None, "dealer_shuffler": "Dealer",
+    }
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+    assert payload["policy"] == "Game Presenters and Shufflers"
+
+
+def test_build_benivo_payload_na_dealer_shuffler_falls_back_to_is_vip_rule():
+    # The field's own "n/a" placeholder means "not a dealer/presenter/
+    # shuffler role" -- falls through to the is_vip rule, unlike a real
+    # catalog value.
+    candidate = {
+        "first_name": "Jane", "last_name": "Doe", "email": "j@example.com",
+        "is_vip": True, "start_date": None, "dealer_shuffler": "n/a",
+    }
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+    assert payload["policy"] == "Tier 1"
 
 
 def test_build_benivo_payload_sends_effective_start_date_not_raw_candidate_start_date():
@@ -642,8 +695,11 @@ def test_build_post_log_insert_uses_real_columns():
     assert row["action"] == "CREATE_USER"
     assert row["status"] == "SUCCESS"
     assert row["is_vip"] is False
-    assert row["policy_name"] == "Basic"
-    assert row["policy_api_value"] == "Tier 1"
+    # policy_name/policy_api_value are the fixed post_log DB column names
+    # (see build_post_log_insert()'s docstring) -- they now carry the
+    # corrected Population value, not the retired Basic/VIP business label.
+    assert row["policy_name"] == "Tier 3"
+    assert row["policy_api_value"] == "Tier 3"
     assert row["benivo_user_id"] == 1
     assert row["benivo_assignment_id"] == 2
     assert row["request_payload"] == {"firstName": "Jane"}
@@ -664,8 +720,29 @@ def test_build_post_log_insert_vip_candidate():
     row = posting.build_post_log_insert("run-123", candidate, result)
 
     assert row["is_vip"] is True
-    assert row["policy_name"] == "VIP"
-    assert row["policy_api_value"] == "Tier 2"  # confirmed 2026-08-24 temporary business rule
+    assert row["policy_name"] == "Tier 1"  # confirmed 2026-09-02 business rule
+    assert row["policy_api_value"] == "Tier 1"
+
+
+def test_build_post_log_insert_game_presenter_candidate():
+    candidate = {
+        "application_eid": "APP-GP", "candidate_eid": "CAND-GP", "email": "gp@example.com",
+        "is_vip": False, "dealer_shuffler": "Presenter",
+    }
+    result = {
+        "outcome": "success",
+        "request_payload": {"firstName": "GP"},
+        "response_payload": {},
+        "error_message": None,
+        "benivo_user_id": 9,
+        "benivo_assignment_id": 10,
+        "benivo_profile_url": None,
+    }
+
+    row = posting.build_post_log_insert("run-123", candidate, result)
+
+    assert row["policy_name"] == "Game Presenters and Shufflers"
+    assert row["policy_api_value"] == "Game Presenters and Shufflers"
 
 
 def test_build_post_log_insert_includes_start_date_audit_fields():
@@ -859,8 +936,8 @@ def test_record_post_result_uses_one_transaction_for_both_writes():
     assert insert_params[4] == "CREATE_USER"  # action
     assert insert_params[5] == "SUCCESS"  # status
     assert insert_params[6] is None  # is_vip (candidate has no is_vip key)
-    assert insert_params[7] == "Basic"  # policy_name (None is_vip still resolves to Basic)
-    assert insert_params[8] == "Tier 1"  # policy_api_value
+    assert insert_params[7] == "Tier 3"  # policy_name column, now holding population_name (None is_vip, no dealer_shuffler -> Tier 3)
+    assert insert_params[8] == "Tier 3"  # policy_api_value column, now holding population_api_value
     assert insert_params[-1] == 200  # http_status_code -- last positional param before posted_at=NOW()
 
     update_sql, update_params = mock_cursor.execute.call_args_list[1][0]

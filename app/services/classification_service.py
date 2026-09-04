@@ -15,6 +15,7 @@ import psycopg2
 
 from app.clients.database_client import transaction
 from app.models.domain import (
+    EXCLUDED_MOBILITY_SUPPORT,
     NEEDS_RECRUITER_REVIEW,
     PENDING_MISSING_START_DATE,
     PENDING_OFFICE_MAPPING,
@@ -22,6 +23,8 @@ from app.models.domain import (
     READY_TO_POST,
     TERMINAL_CANDIDATE_STATUSES,
 )
+from app.repositories.candidate_repository import MOBILITY_SUPPORT_SUBQUERY
+from app.services.mobility_scope_service import mobility_support_qualifies
 from app.services.office_resolution_service import resolve_office_name
 from app.services.start_date_service import resolve_effective_start_date
 
@@ -37,15 +40,34 @@ def classify(
     start_date: Any,
     workplace: Optional[str],
     execution_timestamp: datetime,
+    mobility_support: Optional[str] = None,
 ) -> str:
     """
-    Pure business rule, no network I/O (office check is against the static,
-    explicit office_resolution_service.WORKPLACE_TO_OFFICE_NAME mapping
-    only -- no API call):
-      Yes + effective start date resolved + workplace mapped    -> READY_TO_POST
-      Yes + effective start date resolved + workplace unmapped  -> PENDING_OFFICE_MAPPING
-      Yes + effective start date NOT resolved                   -> PENDING_MISSING_START_DATE
-      No / null / unrecognized                                  -> NEEDS_RECRUITER_REVIEW
+    Pure business rule, no network I/O (office resolution is against the
+    static, explicit office_resolution_service.WORKPLACE_TO_OFFICE_NAME
+    mapping only -- no API call):
+      relocation != Yes                                          -> NEEDS_RECRUITER_REVIEW
+      mobility_support doesn't request Relocation/Visa/Accommodation
+                                                                   -> EXCLUDED_MOBILITY_SUPPORT
+      effective start date NOT resolved                          -> PENDING_MISSING_START_DATE
+      workplace unmapped                                         -> PENDING_OFFICE_MAPPING
+      otherwise                                                  -> READY_TO_POST
+
+    mobility_support defaults to None only so this signature stays
+    introspectable; every real caller (classify_candidates() below) always
+    passes it explicitly -- a None mobility_support fails the qualification
+    check the same way a missing Jobvite field does (see
+    mobility_scope_service.mobility_support_qualifies()), it is never
+    silently treated as "qualifies".
+
+    CORRECTED 2026-09-05: this function previously also excluded "domestic
+    relocation" candidates (home country == the resolved Benivo office's
+    host country) whose destination wasn't UAE. Mobility explicitly
+    corrected this: domestic/local status is NOT a general exclusion gate
+    for any country -- mobility_support alone determines scope. See
+    mobility_scope_service.py's module docstring for the full correction;
+    that domestic-comparison logic has been removed from this codebase
+    entirely, not merely disabled.
 
     start_date is Jobvite-sourced and may be missing. When it is,
     resolve_effective_start_date() (temporary business rule, see that
@@ -57,6 +79,9 @@ def classify(
 
     if value != "yes":
         return NEEDS_RECRUITER_REVIEW
+
+    if not mobility_support_qualifies(mobility_support):
+        return EXCLUDED_MOBILITY_SUPPORT
 
     effective_start_date, _source = resolve_effective_start_date(start_date, execution_timestamp)
 
@@ -71,10 +96,11 @@ def classify(
 
 def _fetch_classifiable_candidates(cur) -> List[Dict[str, Any]]:
     cur.execute(
-        """
-        SELECT id, is_relocation_required, start_date, workplace
-        FROM benivo.candidates
-        WHERE benivo_status IS DISTINCT FROM %s
+        f"""
+        SELECT c.id, c.is_relocation_required, c.start_date, c.workplace,
+               {MOBILITY_SUPPORT_SUBQUERY}
+        FROM benivo.candidates c
+        WHERE c.benivo_status IS DISTINCT FROM %s
         """,
         (POSTED,),
     )
@@ -96,6 +122,7 @@ def classify_candidates() -> Dict[str, int]:
         PENDING_MISSING_START_DATE: 0,
         PENDING_OFFICE_MAPPING: 0,
         NEEDS_RECRUITER_REVIEW: 0,
+        EXCLUDED_MOBILITY_SUPPORT: 0,
         "updated": 0,
         "unchanged": 0,
     }
@@ -106,7 +133,11 @@ def classify_candidates() -> Dict[str, int]:
 
             for row in rows:
                 new_status = classify(
-                    row["is_relocation_required"], row["start_date"], row["workplace"], execution_timestamp
+                    row["is_relocation_required"],
+                    row["start_date"],
+                    row["workplace"],
+                    execution_timestamp,
+                    mobility_support=row["mobility_support"],
                 )
                 counts[new_status] += 1
 

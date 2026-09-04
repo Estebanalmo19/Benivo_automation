@@ -2,6 +2,7 @@ import datetime
 
 from openpyxl import Workbook, load_workbook
 
+from app.services import mobility_scope_service
 from app.services import reporting_service as reporting
 
 SOME_DATE = datetime.date(2026, 1, 1)
@@ -24,6 +25,8 @@ def _candidate(
     home_city=None,
     phone_number=None,
     benivo_assignment_id=None,
+    dealer_shuffler=None,
+    mobility_support=None,
 ):
     return {
         "application_eid": application_eid,
@@ -45,6 +48,13 @@ def _candidate(
         "home_city": home_city,
         "benivo_status": benivo_status,
         "is_vip": is_vip,
+        # Jobvite-sourced (application.job.customField[fieldCode=
+        # 'dealer__shuffler']) -- see candidate_repository.
+        # DEALER_SHUFFLER_SUBQUERY. Deliberately separate from job_title
+        # (Jobvite's own Job Title field) above -- population_service.py
+        # drives Population off this field, never off job_title.
+        "dealer_shuffler": dealer_shuffler,
+        "mobility_support": mobility_support,
         "benivo_assignment_id": benivo_assignment_id,
         "created_at": datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
         "updated_at": datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
@@ -162,14 +172,28 @@ def test_build_row_ready_reason_default():
     assert row["reason"] == reporting.READY_REASON
 
 
-def test_build_row_policy_name_from_is_vip():
-    row_basic = reporting._build_row(_candidate("APP-1", is_vip=False), "reason", EXECUTION_TIMESTAMP)
-    row_vip = reporting._build_row(_candidate("APP-2", is_vip=True), "reason", EXECUTION_TIMESTAMP)
+def test_build_row_population_name_from_dealer_shuffler_and_is_vip():
+    row_tier3 = reporting._build_row(_candidate("APP-1", is_vip=False), "reason", EXECUTION_TIMESTAMP)
+    row_tier1 = reporting._build_row(_candidate("APP-2", is_vip=True), "reason", EXECUTION_TIMESTAMP)
+    row_gp = reporting._build_row(_candidate("APP-3", is_vip=False, dealer_shuffler="Presenter"), "reason", EXECUTION_TIMESTAMP)
 
-    assert row_basic["is_vip"] is False
-    assert row_basic["policy_name"] == "Basic"
-    assert row_vip["is_vip"] is True
-    assert row_vip["policy_name"] == "VIP"
+    assert row_tier3["is_vip"] is False
+    assert row_tier3["population_name"] == "Tier 3"
+    assert row_tier1["is_vip"] is True
+    assert row_tier1["population_name"] == "Tier 1"
+    assert row_gp["population_name"] == "Game Presenters and Shufflers"
+
+
+def test_build_row_scope_eligibility_computed_independently():
+    # _candidate() default has no mobility_support -> scope-ineligible,
+    # regardless of the "reason" this row landed on its sheet for.
+    row_no_support = reporting._build_row(_candidate("APP-1"), "some other reason", EXECUTION_TIMESTAMP)
+    assert row_no_support["scope_eligibility"] == "No"
+
+    row_qualifies = reporting._build_row(
+        _candidate("APP-2", mobility_support="Relocation", home_country="Romania"), "some other reason", EXECUTION_TIMESTAMP
+    )
+    assert row_qualifies["scope_eligibility"] == "Yes"
 
 
 def test_build_row_reports_jobvite_start_date_source_when_present():
@@ -195,23 +219,62 @@ def test_build_ready_to_post_row_has_all_columns():
     assert set(row.keys()) == set(reporting.READY_TO_POST_COLUMNS)
 
 
-def test_build_ready_to_post_row_uses_business_policy_label():
-    row_basic = reporting._build_ready_to_post_row(_complete_candidate(is_vip=False), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True)
-    row_vip = reporting._build_ready_to_post_row(_complete_candidate(is_vip=True), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=False)
+def test_build_ready_to_post_row_shows_dealer_shuffler():
+    row = reporting._build_ready_to_post_row(
+        _complete_candidate(dealer_shuffler="Presenter"), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True
+    )
 
-    assert row_basic["Policy"] == "Basic"
-    assert row_vip["Policy"] == "VIP"
+    assert row["Dealer / Shuffler"] == "Presenter"
+    assert row["Benivo Population"] == "Game Presenters and Shufflers"
 
 
-def test_build_ready_to_post_row_mobility_vip_and_tier_columns():
+def test_build_ready_to_post_row_shows_mobility_support():
+    row = reporting._build_ready_to_post_row(
+        _complete_candidate(mobility_support="Relocation\nAccommodation"), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True
+    )
+
+    assert row["Mobility Support"] == "Relocation\nAccommodation"
+
+
+def test_build_ready_to_post_row_scope_eligibility_yes_when_qualifying():
+    row = reporting._build_ready_to_post_row(
+        _complete_candidate(mobility_support="Relocation"), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True
+    )
+
+    assert row["Scope Eligibility"] == "Yes"
+
+
+def test_build_ready_to_post_row_scope_eligibility_no_when_mobility_support_missing():
+    row = reporting._build_ready_to_post_row(
+        _complete_candidate(mobility_support=None), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True
+    )
+
+    assert row["Scope Eligibility"] == "No"
+
+
+def test_build_ready_to_post_row_scope_eligibility_yes_for_domestic_relocation():
+    # Corrected 2026-09-05: domestic relocation (home_country == workplace's
+    # host country, both "Serbia" here) does NOT exclude -- only
+    # mobility_support does.
+    row = reporting._build_ready_to_post_row(
+        _complete_candidate(mobility_support="Relocation", home_country="Serbia", workplace="Serbia Live Casino"),
+        _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True,
+    )
+
+    assert row["Scope Eligibility"] == "Yes"
+
+
+def test_build_ready_to_post_row_mobility_vip_and_population_columns():
+    # _complete_candidate() has no dealer_shuffler by default -> Tier 3/Tier 1
+    # by is_vip alone (confirmed 2026-09-04 rule).
     row_basic = reporting._build_ready_to_post_row(_complete_candidate(is_vip=False), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True)
     row_vip = reporting._build_ready_to_post_row(_complete_candidate(is_vip=True), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True)
 
     assert row_basic["Mobility VIP"] == "No"
-    assert row_basic["Policy (Tier)"] == "Tier 1"
+    assert row_basic["Benivo Population"] == "Tier 3"
 
     assert row_vip["Mobility VIP"] == "Yes"
-    assert row_vip["Policy (Tier)"] == "Tier 2"
+    assert row_vip["Benivo Population"] == "Tier 1"
 
 
 def test_build_ready_to_post_row_reflects_passed_in_payload_ready():
@@ -254,7 +317,8 @@ def test_build_payload_preview_row_create_payload_matches_posting_service_builde
     assert row["create_lastName"] == expected["lastName"]
     assert row["create_email"] == expected["email"]
     assert row["create_homeCountry"] == expected["homeCountry"] == "Serbia"
-    assert row["create_policy"] == expected["policy"] == "Tier 1"
+    # _complete_candidate() default: no dealer_shuffler, is_vip False -> Tier 3.
+    assert row["create_policy"] == expected["policy"] == "Tier 3"
     assert row["create_officeId"] == expected["officeId"] == "office-1"
     assert row["create_officeName"] == expected["officeName"] == "Serbia (Live Casino)"
     assert row["create_startDateOfAssignment"] == expected["startDateOfAssignment"]
@@ -277,20 +341,67 @@ def test_build_payload_preview_row_case_id_shown_when_already_posted():
     assert row["case_caseId_available"] == 1010696
 
 
-def test_build_payload_preview_row_mobility_vip_and_population_basic():
+def test_build_payload_preview_row_mobility_vip_and_population_tier_3():
     candidate = _complete_candidate(is_vip=False)
     row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
 
     assert row["mobility_vip"] == "No"
-    assert row["create_policy"] == "Tier 1"
+    assert row["population_name"] == "Tier 3"
+    assert row["create_policy"] == "Tier 3"
 
 
-def test_build_payload_preview_row_mobility_vip_and_population_vip():
+def test_build_payload_preview_row_mobility_vip_and_population_tier_1():
     candidate = _complete_candidate(is_vip=True)
     row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
 
     assert row["mobility_vip"] == "Yes"
-    assert row["create_policy"] == "Tier 2"
+    assert row["population_name"] == "Tier 1"
+    assert row["create_policy"] == "Tier 1"
+
+
+def test_build_payload_preview_row_dealer_shuffler_overrides_vip():
+    candidate = _complete_candidate(is_vip=True, dealer_shuffler="Presenter")
+    row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
+
+    assert row["dealer_shuffler"] == "Presenter"
+    assert row["population_name"] == "Game Presenters and Shufflers"
+    assert row["create_policy"] == "Game Presenters and Shufflers"
+
+
+def test_build_payload_preview_row_shows_mobility_support():
+    candidate = _complete_candidate(mobility_support="Visa/work permit")
+    row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
+
+    assert row["mobility_support"] == "Visa/work permit"
+
+
+def test_build_payload_preview_row_scope_eligibility_no_and_reason_when_mobility_support_missing():
+    candidate = _complete_candidate(mobility_support=None)
+    row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
+
+    assert row["scope_eligibility"] == "No"
+    assert row["scope_exclusion_reason"] == mobility_scope_service.SCOPE_REASON_TEXT[
+        mobility_scope_service.SCOPE_REASON_MOBILITY_SUPPORT
+    ]
+
+
+def test_build_payload_preview_row_scope_eligibility_yes_when_qualifying():
+    candidate = _complete_candidate(mobility_support="Relocation")
+    row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
+
+    assert row["scope_eligibility"] == "Yes"
+    assert row["scope_exclusion_reason"] is None
+
+
+def test_build_payload_preview_row_scope_eligibility_yes_for_domestic_relocation():
+    # Corrected 2026-09-05: domestic relocation (home_country == workplace's
+    # host country, both "Serbia" here) does NOT exclude -- only
+    # mobility_support does.
+    candidate = _complete_candidate(mobility_support="Relocation", home_country="Serbia", workplace="Serbia Live Casino")
+    row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
+
+    assert row["scope_eligibility"] == "Yes"
+    assert row["scope_exclusion_reason"] is None
 
 
 def test_build_payload_preview_row_fully_ready_when_complete():
@@ -304,7 +415,7 @@ def test_build_payload_preview_row_fully_ready_when_complete():
     assert row["missing_home_country"] is False
     assert row["missing_job_title"] is False
     assert row["unresolved_office"] is False
-    assert row["invalid_policy"] is False
+    assert row["invalid_population"] is False
 
 
 def test_build_payload_preview_row_missing_home_country_blocks_case_readiness_only():
@@ -344,14 +455,14 @@ def test_build_payload_preview_row_unresolved_office_blocks_create_user_readines
     assert row["payload_ready"] is False
 
 
-def test_build_payload_preview_row_vip_resolves_to_tier_2_and_is_ready():
-    # Confirmed 2026-08-24: VIP now resolves to a confirmed Benivo policy
-    # tier ("Tier 2"), so it no longer blocks readiness -- see policy_service.py.
+def test_build_payload_preview_row_vip_resolves_to_tier_1_and_is_ready():
+    # Confirmed 2026-09-02: every Population value is confirmed, so VIP
+    # never blocks readiness -- see population_service.py.
     candidate = _complete_candidate(is_vip=True)
     row = reporting._build_payload_preview_row(candidate, _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
 
-    assert row["invalid_policy"] is False
-    assert row["create_policy"] == "Tier 2"
+    assert row["invalid_population"] is False
+    assert row["create_policy"] == "Tier 1"
     assert row["ready_to_create_user"] is True
     assert row["payload_ready"] is True
 
@@ -668,6 +779,46 @@ def test_generate_reports_exception_sheets_present_when_nonempty(tmp_path, monke
     assert wb["Pending Office Mapping"].max_row >= 3
     assert wb["Pending Recruiter Review"].max_row >= 3
     assert wb["Country Data Issues"].max_row >= 3
+    assert "Excluded - Benivo Scope" not in wb.sheetnames  # none excluded in _mock_population()
+
+
+def test_generate_reports_excluded_scope_sheet_absent_when_clean(tmp_path, monkeypatch):
+    population = [_candidate("READY-1", benivo_status="READY_TO_POST", home_country="Serbia")]
+    _patch_common(monkeypatch, tmp_path, population)
+
+    report_path, metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    assert "Excluded - Benivo Scope" not in wb.sheetnames
+    assert "Excluded - Domestic Relocation (non-UAE)" not in [
+        row[0].value for row in wb["Executive Summary"].iter_rows(min_row=2)
+    ]
+
+    summary = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
+    assert summary["Excluded - Mobility Support"] == "0 (0.0%)"
+
+
+def test_generate_reports_excluded_scope_sheet_present_with_mobility_support_reason(tmp_path, monkeypatch):
+    population = [
+        _candidate("MS-1", benivo_status="EXCLUDED_MOBILITY_SUPPORT", mobility_support="N/A"),
+        _candidate("READY-1", benivo_status="READY_TO_POST", home_country="Serbia"),
+    ]
+    _patch_common(monkeypatch, tmp_path, population)
+
+    report_path, metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    assert "Excluded - Benivo Scope" in wb.sheetnames
+    assert wb["Excluded - Benivo Scope"].max_row >= 3  # banner/header + 1 data row
+
+    rows = list(wb["Excluded - Benivo Scope"].iter_rows(values_only=True))
+    reasons = [cell for row in rows for cell in row if isinstance(cell, str) and "mobility_support" in cell.lower()]
+    assert any("mobility_support" in r.lower() for r in reasons)
+
+    summary = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
+    assert summary["Excluded - Mobility Support"] == "1 (50.0%)"
+    assert metrics["excluded_mobility_support"] == 1
+    assert "excluded_domestic_relocation" not in metrics
 
 
 def test_generate_reports_ready_to_post_includes_country_columns(tmp_path, monkeypatch):
@@ -790,11 +941,12 @@ def test_generate_reports_executive_summary_has_data_quality_section(tmp_path, m
     assert "Fully Payload Ready (Ready To Post)" in labels
 
 
-def test_generate_reports_mobility_vip_distribution_counts_tier_1_and_tier_2(tmp_path, monkeypatch):
+def test_generate_reports_benivo_population_distribution_counts_all_three_tiers(tmp_path, monkeypatch):
     population = [
-        _candidate("BASIC-1", is_vip=False, benivo_status="READY_TO_POST"),
-        _candidate("BASIC-2", is_vip=False, benivo_status="READY_TO_POST"),
-        _candidate("VIP-1", is_vip=True, benivo_status="READY_TO_POST"),
+        _candidate("TIER3-1", is_vip=False, benivo_status="READY_TO_POST"),
+        _candidate("TIER3-2", is_vip=False, benivo_status="READY_TO_POST"),
+        _candidate("TIER1-1", is_vip=True, benivo_status="READY_TO_POST"),
+        _candidate("GP-1", is_vip=False, dealer_shuffler="Presenter", benivo_status="READY_TO_POST"),
     ]
     _patch_common(monkeypatch, tmp_path, population)
 
@@ -803,11 +955,13 @@ def test_generate_reports_mobility_vip_distribution_counts_tier_1_and_tier_2(tmp
     wb = load_workbook(report_path)
     rows = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
 
-    assert "Mobility VIP Distribution" in rows
-    assert rows["Tier 1"] == "2 (66.7%)"
-    assert rows["Tier 2"] == "1 (33.3%)"
-    assert metrics["mobility_vip_tier_1"] == 2
-    assert metrics["mobility_vip_tier_2"] == 1
+    assert "Benivo Population Distribution" in rows
+    assert rows["Tier 1"] == "1 (25.0%)"
+    assert rows["Tier 3"] == "2 (50.0%)"
+    assert rows["Game Presenters and Shufflers"] == "1 (25.0%)"
+    assert metrics["population_tier_1"] == 1
+    assert metrics["population_tier_3"] == 2
+    assert metrics["population_game_presenters_and_shufflers"] == 1
 
 
 def test_generate_reports_selected_count_never_exceeds_limit(tmp_path, monkeypatch):

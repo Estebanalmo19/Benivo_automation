@@ -87,6 +87,12 @@ COUNTRY_NAME_TO_ISO2 = {
     "turkmenistan": "TM",
     "ukraine": "UA",
     "united arab emirates": "AE",
+    # Added 2026-09-04 for mobility_scope_service.py's UAE-only domestic
+    # relocation rule: office_resolution_service.OFFICE_NAME_TO_HOST_COUNTRY
+    # reads the literal string "UAE" (not the ISO short name), while a
+    # candidate's own home_country/current_country reads "United Arab
+    # Emirates" -- both must resolve to the same ISO2 code to be compared.
+    "uae": "AE",
     "united kingdom": "GB",
     "united states": "US",
     "uzbekistan": "UZ",

@@ -22,6 +22,16 @@ def test_resolve_iso2_covers_non_standard_jobvite_labels():
     assert country_code_service.resolve_iso2("North Macedonia (formerly Macedonia)") == "MK"
 
 
+def test_resolve_iso2_uae_alias_matches_full_name():
+    # Added 2026-09-04 for mobility_scope_service.py's UAE-only domestic
+    # relocation rule: office_resolution_service reads the literal "UAE",
+    # a candidate's own home_country reads "United Arab Emirates" -- both
+    # must resolve to the same code to be compared.
+    assert country_code_service.resolve_iso2("UAE") == "AE"
+    assert country_code_service.resolve_iso2("United Arab Emirates") == "AE"
+    assert country_code_service.resolve_iso2("uae") == "AE"
+
+
 def test_resolve_iso2_fails_safely_on_unknown_country():
     assert country_code_service.resolve_iso2("Neverland") is None
 

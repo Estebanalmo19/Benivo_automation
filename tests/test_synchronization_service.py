@@ -19,8 +19,9 @@ def test_upsert_sql_never_touches_integration_owned_fields_on_conflict():
 def test_upsert_sql_refreshes_is_vip_from_mobility_vip_on_conflict():
     # Confirmed 2026-08-24: mobility_vip IS a confirmed Jobvite source for
     # VIP, so is_vip is now source-owned and refreshed every sync -- the
-    # opposite of the pre-2026-08-24 rule (see policy_service.py for the
-    # one centralized place this then maps to a Benivo policy tier).
+    # opposite of the pre-2026-08-24 rule (see population_service.py for
+    # the one centralized place this then feeds into a Benivo Population
+    # value, alongside dealer_shuffler).
     sql = synchronization_service._UPSERT_SQL
     assert "mobility_vip" in sql
     assert "is_vip = EXCLUDED.is_vip" in sql.split("DO UPDATE SET")[1]

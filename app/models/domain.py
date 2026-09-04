@@ -13,6 +13,12 @@ READY_TO_POST = "READY_TO_POST"
 PENDING_MISSING_START_DATE = "PENDING_MISSING_START_DATE"
 PENDING_OFFICE_MAPPING = "PENDING_OFFICE_MAPPING"
 NEEDS_RECRUITER_REVIEW = "NEEDS_RECRUITER_REVIEW"
+# Benivo scope exclusion -- confirmed with Mobility 2026-09-04, corrected
+# 2026-09-05 to drop a domestic-relocation exclusion this status originally
+# had a sibling for (see app/services/mobility_scope_service.py, the one
+# centralized place this rule lives). Evaluated only for candidates who
+# already passed the is_relocation_required=Yes gate above.
+EXCLUDED_MOBILITY_SUPPORT = "EXCLUDED_MOBILITY_SUPPORT"
 POSTED = "POSTED"
 POST_FAILED = "POST_FAILED"
 
@@ -45,6 +51,13 @@ ACTION_CREATE_USER = "CREATE_USER"
 # the create-user outcome.
 ACTION_UPDATE_CASE = "UPDATE_CASE"
 
-# --- Policy ------------------------------------------------------------------
-POLICY_BASIC = "Basic"
-POLICY_VIP = "VIP"
+# --- Benivo Population ---------------------------------------------------------
+# Confirmed with Mobility 2026-09-02, replacing the retired is_vip-only
+# Basic/VIP -> Tier 1/Tier 2 "policy" scheme (see app/services/
+# population_service.py, which is the one centralized place this business
+# rule lives). These three strings are simultaneously the business label AND
+# the exact Benivo API value -- refdata['policies'] returns exactly these
+# plus nothing else (see migrations/0004's comment).
+POPULATION_GAME_PRESENTERS_AND_SHUFFLERS = "Game Presenters and Shufflers"
+POPULATION_TIER_1 = "Tier 1"
+POPULATION_TIER_3 = "Tier 3"

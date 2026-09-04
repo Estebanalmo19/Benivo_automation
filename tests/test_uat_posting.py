@@ -41,16 +41,18 @@ def test_validate_uat_candidate_all_conditions_pass():
 
     assert result["eligible"] is True
     assert all(result["checks"].values())
-    assert result["summary"]["policy_name"] == "Basic"
-    assert result["summary"]["policy_api_value"] == "Tier 1"
+    # No dealer_shuffler, is_vip False -> Tier 3 (confirmed 2026-09-04 rule).
+    assert result["summary"]["population_name"] == "Tier 3"
+    assert result["summary"]["population_api_value"] == "Tier 3"
     assert result["summary"]["resolved_office_id"] == "68da6b8b-1e07-4742-9333-a882e284c3fb"
     assert result["summary"]["email_masked"] == "j***@example.com"
 
 
-def test_post_log_preserves_both_business_policy_name_and_api_value():
+def test_post_log_preserves_both_business_population_name_and_api_value():
     # Confirms both the business label AND the exact API value survive into
-    # the post_log row -- policy_name is never overwritten by the
-    # API-specific label, and policy_api_value is recorded for audit.
+    # the post_log row -- policy_name/policy_api_value are the fixed DB
+    # column names but now hold population_name/population_api_value (see
+    # build_post_log_insert()'s docstring).
     candidate = {"application_eid": "APP-UAT-1", "candidate_eid": "CAND-1", "email": "jane@example.com", "is_vip": False}
     result = {
         "outcome": "success", "request_payload": {}, "response_payload": {},
@@ -59,8 +61,8 @@ def test_post_log_preserves_both_business_policy_name_and_api_value():
 
     row = posting.build_post_log_insert("run-123", candidate, result)
 
-    assert row["policy_name"] == "Basic"
-    assert row["policy_api_value"] == "Tier 1"
+    assert row["policy_name"] == "Tier 3"
+    assert row["policy_api_value"] == "Tier 3"
 
 
 def test_validate_uat_candidate_not_found():
@@ -148,24 +150,33 @@ def test_validate_uat_candidate_no_refdata_means_office_unresolved():
     assert result["checks"]["office_resolved"] is False
 
 
-def test_validate_uat_candidate_vip_still_fails_the_basic_only_uat_gate():
-    # Confirmed 2026-08-24: VIP now resolves to a confirmed policy tier
-    # ("Tier 2"), so policy_api_value_confirmed and payload_valid flip to
-    # True -- but the single-candidate UAT safety override is deliberately
-    # stricter than general readiness and still requires exactly "Basic"
-    # (policy_name_is_basic), so a VIP candidate remains ineligible for
-    # this specific gate regardless.
+def test_validate_uat_candidate_vip_is_now_eligible():
+    # Confirmed 2026-09-02: every Population value (Tier 1/Tier 3/Game
+    # Presenters and Shufflers) is equally confirmed -- there is no more
+    # "Basic only" restriction on the single-candidate UAT gate (that
+    # restriction existed only because Tier 2/VIP was an unconfirmed guess
+    # at the time; it is retired along with policy_service.py).
     candidate = _eligible_candidate(is_vip=True)
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
          patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
-    assert result["eligible"] is False
-    assert result["checks"]["policy_name_is_basic"] is False
-    assert result["checks"]["policy_api_value_confirmed"] is True
+    assert result["eligible"] is True
+    assert result["checks"]["population_api_value_confirmed"] is True
     assert result["checks"]["payload_valid"] is True
-    assert result["summary"]["policy_name"] == "VIP"
-    assert result["summary"]["policy_api_value"] == "Tier 2"
+    assert result["summary"]["population_name"] == "Tier 1"
+    assert result["summary"]["population_api_value"] == "Tier 1"
+
+
+def test_validate_uat_candidate_game_presenter_is_eligible():
+    candidate = _eligible_candidate(dealer_shuffler="Presenter")
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+        result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
+
+    assert result["eligible"] is True
+    assert result["summary"]["population_name"] == "Game Presenters and Shufflers"
+    assert result["summary"]["population_api_value"] == "Game Presenters and Shufflers"
 
 
 def test_validate_payload_requires_all_fields():

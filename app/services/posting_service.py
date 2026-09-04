@@ -23,7 +23,7 @@ from app.repositories.post_log_repository import get_terminal_post_log_applicati
 from app.services.country_code_service import resolve_iso2 as resolve_country_iso2
 from app.services.home_country_service import resolve_effective_home_country
 from app.services.office_resolution_service import resolve_office
-from app.services.policy_service import resolve_policy_values
+from app.services.population_service import resolve_population_values
 from app.services.start_date_service import resolve_effective_start_date
 from app.utils.helpers import mask_email
 
@@ -119,9 +119,10 @@ def validate_uat_candidate(
     office = resolve_office(candidate, refdata) if refdata is not None else None
     checks["office_resolved"] = office is not None
 
-    policy_name, policy_api_value = resolve_policy_values(candidate.get("is_vip"))
-    checks["policy_name_is_basic"] = policy_name == "Basic"
-    checks["policy_api_value_confirmed"] = policy_api_value is not None
+    population_name, population_api_value = resolve_population_values(
+        candidate.get("dealer_shuffler"), candidate.get("is_vip")
+    )
+    checks["population_api_value_confirmed"] = population_api_value is not None
 
     payload = build_benivo_payload(candidate, office, effective_start_date)
     payload_valid = _validate_payload(payload)
@@ -138,8 +139,9 @@ def validate_uat_candidate(
         "start_date_source": start_date_source,
         "execution_date": execution_timestamp.isoformat(),
         "is_vip": candidate.get("is_vip"),
-        "policy_name": policy_name,
-        "policy_api_value": policy_api_value,
+        "dealer_shuffler": candidate.get("dealer_shuffler"),
+        "population_name": population_name,
+        "population_api_value": population_api_value,
         "payload_valid": payload_valid,
     }
 
@@ -190,11 +192,31 @@ def build_benivo_payload(
     effective_start_date: Any,
 ) -> Dict[str, Any]:
     """
-    "policy" sends policy_api_value (the exact string Benivo's API accepts,
-    e.g. "Tier 1"), never policy_name (the business label "Basic"/"VIP").
-    If policy_api_value is unconfirmed (currently: any VIP candidate), this
-    is None, which _validate_payload() correctly treats as invalid --
-    blocking the create-user call rather than sending a guessed value.
+    "policy" sends population_api_value (see population_service.py).
+    CONFIRMED 2026-09-04 by Mobility: real UAT evidence shows the Create
+    User "policy" value is exactly what appears as Population in the
+    Benivo UI -- so this is no longer the circumstantial inference it was
+    before (matching refdata['policies'] value sets + a live UAT success
+    sending "Tier 1" through it on 2026-07-30 was already strong evidence;
+    it is now a confirmed fact, not merely the best available guess).
+    "policy" carries Population only -- see below for why VIP Status is
+    deliberately absent from this payload.
+
+    Separately, and NOT implemented anywhere in this payload: no Benivo API
+    field or endpoint for a standalone "VIP Status" has ever been confirmed
+    (refdata exposes no such key; the create-user and Case PATCH field lists
+    Gina has confirmed contain none). mobility_vip/is_vip therefore is NOT
+    sent to Benivo under any field name here -- it remains an internal/
+    reporting value only (see reporting_service.py's "Mobility VIP" column)
+    and one input to resolve_population_values() above. If Benivo requires
+    VIP Status to be sent as its own field, that field name/endpoint must be
+    confirmed before it can be added.
+
+    If population_api_value is somehow unconfirmed (not reachable today --
+    resolve_population_values() always returns one of the three known
+    values), this is None, which _validate_payload() correctly treats as
+    invalid -- blocking the create-user call rather than sending a guessed
+    value.
 
     effective_start_date is the already-resolved date (Jobvite-sourced or
     calculated -- see start_date_service.resolve_effective_start_date()),
@@ -225,14 +247,14 @@ def build_benivo_payload(
     current_country reliably fills. See build_case_update_payload(), which
     uses the exact same resolution for homeLocation.country.
     """
-    _, policy_api_value = resolve_policy_values(candidate.get("is_vip"))
+    _, population_api_value = resolve_population_values(candidate.get("dealer_shuffler"), candidate.get("is_vip"))
     effective_home_country, _home_country_source = resolve_effective_home_country(candidate)
 
     return {
         "firstName": candidate.get("first_name"),
         "lastName": candidate.get("last_name"),
         "email": candidate.get("email"),
-        "policy": policy_api_value,
+        "policy": population_api_value,
         "officeId": office["officeId"] if office else None,
         "officeName": office["officeName"] if office else None,
         "startDateOfAssignment": _format_start_date(effective_start_date),
@@ -355,8 +377,9 @@ def post_single_candidate(
             "request_payload": payload,
             "response_payload": None,
             "error_message": (
-                f"Payload invalid before sending to Benivo -- likely no confirmed policy_api_value for "
-                f"is_vip={candidate.get('is_vip')!r}. Not attempting create-user with an unconfirmed/guessed value."
+                f"Payload invalid before sending to Benivo -- likely no confirmed population_api_value for "
+                f"dealer_shuffler={candidate.get('dealer_shuffler')!r}, is_vip={candidate.get('is_vip')!r}. "
+                f"Not attempting create-user with an unconfirmed/guessed value."
             ),
             "benivo_user_id": None,
             "benivo_assignment_id": None,
@@ -486,7 +509,9 @@ def post_candidates(candidates: List[Dict[str, Any]], dry_run: bool) -> List[Dic
                 candidate.get("start_date"), execution_timestamp
             )
             payload = build_benivo_payload(candidate, office, effective_start_date)
-            policy_name, policy_api_value = resolve_policy_values(candidate.get("is_vip"))
+            population_name, population_api_value = resolve_population_values(
+                candidate.get("dealer_shuffler"), candidate.get("is_vip")
+            )
 
             # caseId is only known once create-user actually succeeds (it's
             # the returned assignmentId), so the preview shows the Case
@@ -501,8 +526,9 @@ def post_candidates(candidates: List[Dict[str, Any]], dry_run: bool) -> List[Dic
                     "office_resolved": office is not None,
                     "office_resolution_note": refdata_note,
                     "is_vip": candidate.get("is_vip"),
-                    "policy_name": policy_name,
-                    "policy_api_value": policy_api_value,
+                    "dealer_shuffler": candidate.get("dealer_shuffler"),
+                    "population_name": population_name,
+                    "population_api_value": population_api_value,
                     "start_date_source": start_date_source,
                     "effective_start_date": str(effective_start_date) if effective_start_date else None,
                     "execution_date": execution_timestamp.isoformat(),
@@ -530,6 +556,20 @@ def build_post_log_insert(run_id: str, candidate: Dict[str, Any], result: Dict[s
     Pure: maps a candidate + posting result to the exact benivo.post_log
     column values. No I/O.
 
+    is_vip/policy_name/policy_api_value: post_log's DB columns are still
+    literally named policy_name/policy_api_value (see
+    post_log_repository.insert_post_log_row(), which is a fixed-column
+    positional INSERT) -- renaming them requires a migration, which is
+    proposed but deliberately NOT applied as part of this change (this
+    investigation was scoped to read-only DB queries; see the accompanying
+    report for the exact migration to run before this repurposing should be
+    considered permanent). Until then, these two columns are repurposed to
+    hold the corrected Population values (population_name/
+    population_api_value from population_service.py) rather than the
+    retired Basic/VIP business label -- the dict keys below must stay
+    "policy_name"/"policy_api_value" to match insert_post_log_row(), but
+    what they now contain is Population, not Policy.
+
     execution_date/effective_start_date/start_date_source/http_status_code
     come from `result` (set by post_single_candidate()) via .get() --
     callers/tests that construct a `result` dict without them (predating
@@ -539,7 +579,7 @@ def build_post_log_insert(run_id: str, candidate: Dict[str, Any], result: Dict[s
     """
     post_log_status = _post_log_status_from_outcome(result["outcome"])
     is_vip = candidate.get("is_vip")
-    policy_name, policy_api_value = resolve_policy_values(is_vip)
+    population_name, population_api_value = resolve_population_values(candidate.get("dealer_shuffler"), is_vip)
 
     return {
         "run_id": run_id,
@@ -549,8 +589,8 @@ def build_post_log_insert(run_id: str, candidate: Dict[str, Any], result: Dict[s
         "action": ACTION_CREATE_USER,
         "status": post_log_status,
         "is_vip": is_vip,
-        "policy_name": policy_name,
-        "policy_api_value": policy_api_value,
+        "policy_name": population_name,
+        "policy_api_value": population_api_value,
         "benivo_user_id": result["benivo_user_id"],
         "benivo_assignment_id": result["benivo_assignment_id"],
         "benivo_profile_url": result["benivo_profile_url"],

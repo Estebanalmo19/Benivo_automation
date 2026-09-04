@@ -36,9 +36,10 @@ DEFAULT_BENIVO_STATUS = "PENDING"
 # mobility_vip = 'Yes', FALSE when it's 'No' or the field is absent
 # entirely (COALESCE guards the "absent" case, since a raw SQL comparison
 # against NULL would itself evaluate to NULL, not FALSE). See
-# app/services/policy_service.py for the one centralized place this value
-# feeds into a Benivo policy tier -- never duplicate that mapping here or
-# anywhere else.
+# app/services/population_service.py for the one centralized place this
+# value (alongside dealer_shuffler, joined separately -- see
+# candidate_repository.DEALER_SHUFFLER_SUBQUERY) feeds into a Benivo
+# Population value -- never duplicate that mapping here or anywhere else.
 #
 # start_date, workplace, and home_country ARE source-owned and must be
 # refreshed every sync (per confirmed evidence, see git history and the

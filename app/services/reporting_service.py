@@ -21,9 +21,13 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from app import config
 from app.clients import benivo_client
-from app.models.domain import ACTION_CREATE_USER, ACTION_UPDATE_CASE
+from app.models.domain import (
+    ACTION_CREATE_USER,
+    ACTION_UPDATE_CASE,
+    EXCLUDED_MOBILITY_SUPPORT,
+)
 from app.repositories import candidate_repository, post_log_repository
-from app.services import posting_service
+from app.services import mobility_scope_service, posting_service
 from app.services.home_country_service import (
     SOURCE_CANDIDATE_HOME_COUNTRY,
     SOURCE_CURRENT_LOCATION,
@@ -31,7 +35,7 @@ from app.services.home_country_service import (
     resolve_effective_home_country,
 )
 from app.services.office_resolution_service import resolve_office
-from app.services.policy_service import resolve_policy, resolve_policy_values
+from app.services.population_service import resolve_population_values
 from app.services.start_date_service import resolve_effective_start_date
 
 logger = logging.getLogger(__name__)
@@ -110,7 +114,7 @@ _NEGATIVE_BOOL_COLUMNS = {
     "missing_job_title",
     "missing_effective_start_date",
     "unresolved_office",
-    "invalid_policy",
+    "invalid_population",
 }
 
 # Columns whose values are free text and should wrap + left-align instead
@@ -124,7 +128,7 @@ _KEY_KPI_LABELS = {
     "Successfully Posted",
     "Failed",
     GO_LIVE_AUTOMATICALLY_ELIGIBLE,
-    "Tier 2",
+    "Game Presenters and Shufflers",
 }
 
 _THIN_SIDE = Side(style="thin", color=COLOR_BORDER)
@@ -162,7 +166,10 @@ REQUIRED_COLUMNS = [
     "location",
     "benivo_status",
     "is_vip",
-    "policy_name",
+    "dealer_shuffler",
+    "population_name",
+    "mobility_support",
+    "scope_eligibility",
     "reason",
     "selected_for_current_run",
 ]
@@ -183,10 +190,11 @@ READY_TO_POST_COLUMNS = [
     "Country Sent to Benivo",
     "Country Source",
     "Job Title",
-    "Policy",
-    "VIP",
+    "Dealer / Shuffler",
     "Mobility VIP",
-    "Policy (Tier)",
+    "Mobility Support",
+    "Benivo Population",
+    "Scope Eligibility",
     "Original Start Date",
     "Effective Start Date",
     "Start Date Source",
@@ -229,8 +237,12 @@ PAYLOAD_PREVIEW_COLUMNS = [
     "resolved_host_country",
     "is_vip",
     "mobility_vip",
-    "policy_name",
-    "policy_api_value",
+    "dealer_shuffler",
+    "mobility_support",
+    "population_name",
+    "population_api_value",
+    "scope_eligibility",
+    "scope_exclusion_reason",
     # Create User payload preview (== posting_service.build_benivo_payload())
     "create_firstName",
     "create_lastName",
@@ -255,7 +267,7 @@ PAYLOAD_PREVIEW_COLUMNS = [
     "missing_job_title",
     "missing_effective_start_date",
     "unresolved_office",
-    "invalid_policy",
+    "invalid_population",
     "ready_to_create_user",
     "ready_to_update_case",
     "payload_ready",
@@ -314,6 +326,10 @@ READY_REASON = "Candidate meets all current posting requirements"
 RELOCATION_NO_REASON = "Relocation is marked as No and requires recruiter confirmation"
 RELOCATION_UNRECOGNIZED_REASON = "Relocation value is blank or unrecognized and requires recruiter confirmation"
 MISSING_OFFICE_REASON = "No confirmed Benivo office mapping exists for the candidate workplace"
+# See mobility_scope_service.SCOPE_REASON_TEXT -- the exact same reason
+# strings, reused here rather than duplicated, so classify()'s decision and
+# this report's explanation of it can never drift apart.
+MOBILITY_SUPPORT_EXCLUDED_REASON = mobility_scope_service.SCOPE_REASON_TEXT[mobility_scope_service.SCOPE_REASON_MOBILITY_SUPPORT]
 COUNTRY_ISSUE_MISSING_REASON = (
     "No country available from Jobvite -- both candidate_home_country and current_country are blank"
 )
@@ -371,6 +387,20 @@ def _pct(count: int, denominator: int) -> str:
     return f"{(count / denominator) * 100:.1f}%"
 
 
+def _resolve_scope_display(candidate: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    """
+    ("Yes"/"No", reason text or None) -- computed independently via
+    mobility_scope_service.resolve_scope() for EVERY candidate, regardless
+    of which sheet/benivo_status they currently have. This is deliberate:
+    e.g. a Pending Office Mapping candidate might ALSO fail the
+    mobility_support scope rule, which is useful to surface even before
+    their office gets mapped.
+    """
+    in_scope, reason_code = mobility_scope_service.resolve_scope(candidate.get("mobility_support"))
+    reason_text = mobility_scope_service.SCOPE_REASON_TEXT.get(reason_code) if reason_code else None
+    return ("Yes" if in_scope else "No"), reason_text
+
+
 def _build_row(
     candidate: Dict[str, Any],
     reason: str,
@@ -399,7 +429,10 @@ def _build_row(
         "location": candidate.get("location"),
         "benivo_status": candidate.get("benivo_status"),
         "is_vip": candidate.get("is_vip"),
-        "policy_name": resolve_policy(candidate.get("is_vip")),
+        "dealer_shuffler": candidate.get("dealer_shuffler"),
+        "population_name": resolve_population_values(candidate.get("dealer_shuffler"), candidate.get("is_vip"))[0],
+        "mobility_support": candidate.get("mobility_support"),
+        "scope_eligibility": _resolve_scope_display(candidate)[0],
         "reason": reason,
         "selected_for_current_run": "Yes" if selected else "No",
     }
@@ -496,7 +529,7 @@ def _build_ready_to_post_row(
     given candidate is actually ready.
     """
     effective_start_date, start_date_source = resolve_effective_start_date(candidate.get("start_date"), execution_timestamp)
-    policy_name, policy_api_value = resolve_policy_values(candidate.get("is_vip"))
+    _population_name, population_api_value = resolve_population_values(candidate.get("dealer_shuffler"), candidate.get("is_vip"))
     effective_home_country, home_country_source = resolve_effective_home_country(candidate)
 
     return {
@@ -512,17 +545,35 @@ def _build_ready_to_post_row(
         "Country Sent to Benivo": effective_home_country,
         "Country Source": home_country_source,
         "Job Title": candidate.get("job_title"),
-        "Policy": policy_name,
-        "VIP": candidate.get("is_vip"),
+        # Jobvite-sourced (application.job.customField[fieldCode=
+        # 'dealer__shuffler'] -- see candidate_repository.
+        # DEALER_SHUFFLER_SUBQUERY), NOT Jobvite's own "Job Title" column
+        # above -- this is what actually drives Game Presenter/Shuffler
+        # Population classification. HiBob/hr_work_title is no longer used.
+        "Dealer / Shuffler": candidate.get("dealer_shuffler"),
         # mobility_vip source field is synced directly into is_vip (see
         # synchronization_service.py) -- "Yes"/"No" here is exactly that
         # boolean formatted back to the raw Jobvite label, not a separate
-        # stored value, so it can never drift from what is_vip holds.
+        # stored value, so it can never drift from what is_vip holds. The
+        # raw is_vip boolean itself is not repeated here (redundant) -- see
+        # Payload Preview for the raw technical value.
         "Mobility VIP": "Yes" if candidate.get("is_vip") else "No",
+        # Raw Jobvite multi-select value -- see mobility_scope_service.py
+        # for how it's parsed. Every row on this sheet already qualifies
+        # (READY_TO_POST implies it passed the scope gate), so this is shown
+        # for audit context, not as a pass/fail flag.
+        "Mobility Support": candidate.get("mobility_support"),
         # The literal Benivo API value that will actually be sent -- see
-        # policy_service.POLICY_NAME_TO_API_VALUE, the one centralized
-        # mapping this and every other consumer reads.
-        "Policy (Tier)": policy_api_value,
+        # population_service.resolve_population_values(), the one
+        # centralized mapping this and every other consumer reads.
+        # Population and VIP Status are separate Benivo concepts; there is
+        # no confirmed "VIP Status" column here -- see this workbook's
+        # Instructions sheet.
+        "Benivo Population": population_api_value,
+        # Independently recomputed via mobility_scope_service.resolve_scope()
+        # -- always "Yes" here (READY_TO_POST already implies it), shown for
+        # a consistent column set with the exception sheets.
+        "Scope Eligibility": _resolve_scope_display(candidate)[0],
         "Original Start Date": _excel_safe(candidate.get("start_date")),
         "Effective Start Date": _excel_safe(effective_start_date),
         "Start Date Source": start_date_source,
@@ -557,7 +608,8 @@ def _build_payload_preview_row(
     case_data = case_payload.get("data") or {}
     case_home_country_iso = (case_data.get("homeLocation") or {}).get("country")
 
-    policy_name, policy_api_value = resolve_policy_values(candidate.get("is_vip"))
+    population_name, population_api_value = resolve_population_values(candidate.get("dealer_shuffler"), candidate.get("is_vip"))
+    scope_eligibility, scope_exclusion_reason = _resolve_scope_display(candidate)
     # Same resolution build_case_update_payload() feeds into
     # country_code_service.resolve_iso2() -- shown here separately (pre-ISO
     # conversion) so ops can see the plain country name alongside the ISO
@@ -566,7 +618,7 @@ def _build_payload_preview_row(
     effective_home_country, home_country_source = resolve_effective_home_country(candidate)
 
     unresolved_office = office is None
-    invalid_policy = policy_api_value is None
+    invalid_population = population_api_value is None
 
     missing_create_fields = [field for field in CREATE_USER_REQUIRED_FOR_READINESS if not create_payload.get(field)]
     ready_to_create_user = not missing_create_fields
@@ -613,8 +665,12 @@ def _build_payload_preview_row(
         "resolved_host_country": office.get("hostCountry") if office else None,
         "is_vip": candidate.get("is_vip"),
         "mobility_vip": "Yes" if candidate.get("is_vip") else "No",
-        "policy_name": policy_name,
-        "policy_api_value": policy_api_value,
+        "dealer_shuffler": candidate.get("dealer_shuffler"),
+        "mobility_support": candidate.get("mobility_support"),
+        "population_name": population_name,
+        "population_api_value": population_api_value,
+        "scope_eligibility": scope_eligibility,
+        "scope_exclusion_reason": scope_exclusion_reason,
         "create_firstName": create_payload.get("firstName"),
         "create_lastName": create_payload.get("lastName"),
         "create_email": create_payload.get("email"),
@@ -638,7 +694,7 @@ def _build_payload_preview_row(
         "missing_job_title": not candidate.get("job_title"),
         "missing_effective_start_date": effective_start_date is None,
         "unresolved_office": unresolved_office,
-        "invalid_policy": invalid_policy,
+        "invalid_population": invalid_population,
         "ready_to_create_user": ready_to_create_user,
         "ready_to_update_case": ready_to_update_case,
         "payload_ready": payload_ready,
@@ -890,21 +946,46 @@ def _write_instructions_sheet(ws: Worksheet, banner_text: str) -> None:
             "everyone about to be posted. Payload Preview: the exact technical fields the integration would send, "
             "plus data-quality flags -- use this to troubleshoot a specific candidate. Posting Results: what "
             "actually happened this run, read from the permanent audit log. Pending Office Mapping / Pending "
-            "Recruiter Review / Country Data Issues: exception lists needing action (only appear when non-empty). "
-            "Go-Live Status: where each candidate sits relative to the production go-live cutover.",
+            "Recruiter Review / Excluded - Benivo Scope / Country Data Issues: exception lists needing action "
+            "(only appear when non-empty). Go-Live Status: where each candidate sits relative to the production "
+            "go-live cutover.",
         ),
         (
             "Meaning of the main statuses",
             "READY_TO_POST: all requirements met, awaiting automatic posting. POSTED: successfully created in "
             "Benivo. POST_FAILED: a posting attempt failed and will be retried automatically. "
             "PENDING_OFFICE_MAPPING: the Jobvite workplace has no confirmed Benivo office yet. "
-            "NEEDS_RECRUITER_REVIEW: relocation is not confirmed \"Yes\".",
+            "NEEDS_RECRUITER_REVIEW: relocation is not confirmed \"Yes\". EXCLUDED_MOBILITY_SUPPORT: "
+            "mobility_support does not include Relocation/Visa/work permit/Accommodation -- see \"Benivo Scope\" "
+            "below.",
         ),
         (
-            "Mobility VIP / Policy Tier",
-            "\"Mobility VIP\" reflects Jobvite's own mobility_vip field (Yes/No). Current rule, confirmed by "
-            "Mobility (temporary until they define otherwise): Mobility VIP = Yes sends Policy Tier 2 to Benivo; "
-            "otherwise Tier 1.",
+            "Dealer / Shuffler, Mobility VIP, Benivo Population",
+            "Population and VIP Status are separate Benivo concepts. \"Mobility VIP\" reflects Jobvite's own "
+            "mobility_vip field (Yes/No) and is shown for information only -- there is no confirmed Benivo API "
+            "field to send a standalone VIP Status, so it is never sent to Benivo under any field name. \"Dealer / "
+            "Shuffler\" is Jobvite's own job.customField[fieldCode='dealer__shuffler'] value, not Jobvite's Job "
+            "Title (HiBob/hr_work_title is no longer used for this). \"Benivo Population\" is the confirmed rule "
+            "(Mobility, 2026-09-04): dealer_shuffler is a controlled Jobvite selector -- ANY real catalog value "
+            "(\"Presenter\", \"Dealer\", \"Shuffler\", \"Gameshow host\", \"Prive Specialist Dealer\", or any "
+            "future catalog addition) -> \"Game Presenters and Shufflers\"; the field's own \"n/a\" placeholder "
+            "(meaning \"not a dealer/presenter/shuffler role\") and a missing value do NOT count -- otherwise "
+            "Mobility VIP = Yes -> \"Tier 1\"; otherwise -> \"Tier 3\". This value is sent to Benivo's create-user \"policy\" "
+            "field -- confirmed by real UAT evidence (2026-09-04) that the \"policy\" value is exactly what "
+            "appears as Population in the Benivo UI.",
+        ),
+        (
+            "Mobility Support and Benivo Scope",
+            "\"Mobility Support\" is Jobvite's own multi-select mobility_support value (e.g. \"Relocation / "
+            "Visa/work permit / Accommodation\", newline-separated in the raw data). A candidate is in Benivo "
+            "scope if and only if it includes Relocation, Visa/work permit, or Accommodation (any combination -- "
+            "\"N/A\" alone, blank, or missing does not qualify). This is the ONLY scope rule -- domestic/local "
+            "relocation (e.g. within Serbia, Romania, or Bulgaria) does NOT exclude a candidate on its own; a "
+            "domestic candidate with a qualifying Mobility Support selection is in scope exactly like an "
+            "international one, UAE included. \"Scope Eligibility\" (Yes/No) reflects this rule, recomputed "
+            "independently on every sheet -- so it can read \"No\" even on Pending Office Mapping/Pending "
+            "Recruiter Review rows that failed for a different reason too. See the \"Excluded - Benivo Scope\" "
+            "sheet (only present when non-empty) for exactly who was excluded and why.",
         ),
         (
             "Jobvite Start Date vs Calculated Start Date",
@@ -1065,6 +1146,7 @@ def generate_reports(
     # mapping) -- this report displays that decision, it does not re-derive it.
     ready_to_post_population = [c for c in mobility_candidates if c.get("benivo_status") == "READY_TO_POST"]
     pending_office_mapping_population = [c for c in mobility_candidates if c.get("benivo_status") == "PENDING_OFFICE_MAPPING"]
+    excluded_mobility_support_population = [c for c in mobility_candidates if c.get("benivo_status") == EXCLUDED_MOBILITY_SUPPORT]
 
     refdata = _fetch_refdata_if_allowed()
 
@@ -1105,6 +1187,19 @@ def generate_reports(
         for c in relocation_unrecognized
     ]
 
+    # "Excluded - Benivo Scope": candidates who confirmed relocation=Yes but
+    # were excluded by the confirmed mobility_support scope rule (see
+    # mobility_scope_service.py) -- distinct from Pending Office
+    # Mapping/Pending Recruiter Review, which are blocked on missing/
+    # unconfirmed data rather than a deliberate scope exclusion. Domestic/
+    # local relocation is NOT a scope exclusion (corrected 2026-09-05) --
+    # a domestic candidate with a qualifying mobility_support selection
+    # never appears here.
+    excluded_scope_rows = [
+        _build_row(c, MOBILITY_SUPPORT_EXCLUDED_REASON, execution_timestamp, selected=c.get("application_eid") in selected_eids)
+        for c in excluded_mobility_support_population
+    ]
+
     # Country Data Issues: independent of benivo_status -- includes
     # READY_TO_POST candidates as well as any PENDING_OFFICE_MAPPING/POSTED
     # candidate with a country issue, so the sheet and its Executive
@@ -1123,18 +1218,25 @@ def generate_reports(
 
     country_data_issue_rows = [_build_country_data_issue_row(c) for c in country_data_issue_candidates]
 
-    # Mobility VIP / policy tier distribution -- same population scope as
-    # Country Source Distribution above (relocation_yes, not just
-    # READY_TO_POST) so both "distribution" sections in the Executive
-    # Summary answer the same question: "of everyone we could potentially
-    # post, how do they break down". Tier resolution goes through
-    # policy_service.resolve_policy_values() -- the one centralized place
-    # -- never re-derived here.
-    mobility_vip_tier_1_count = sum(
-        1 for c in relocation_yes if resolve_policy_values(c.get("is_vip"))[1] == "Tier 1"
+    # Benivo Population distribution -- same population scope as Country
+    # Source Distribution above (relocation_yes, not just READY_TO_POST) so
+    # both "distribution" sections in the Executive Summary answer the same
+    # question: "of everyone we could potentially post, how do they break
+    # down". Resolution goes through population_service.resolve_population_values()
+    # -- the one centralized place -- never re-derived here. Replaces the
+    # retired Mobility VIP / Policy Tier (Tier 1/Tier 2, is_vip-only)
+    # distribution -- see population_service.py for why that mapping was
+    # conceptually wrong (it treated Population as if it were Policy).
+    population_tier_1_count = sum(
+        1 for c in relocation_yes if resolve_population_values(c.get("dealer_shuffler"), c.get("is_vip"))[1] == "Tier 1"
     )
-    mobility_vip_tier_2_count = sum(
-        1 for c in relocation_yes if resolve_policy_values(c.get("is_vip"))[1] == "Tier 2"
+    population_tier_3_count = sum(
+        1 for c in relocation_yes if resolve_population_values(c.get("dealer_shuffler"), c.get("is_vip"))[1] == "Tier 3"
+    )
+    population_game_presenters_and_shufflers_count = sum(
+        1
+        for c in relocation_yes
+        if resolve_population_values(c.get("dealer_shuffler"), c.get("is_vip"))[1] == "Game Presenters and Shufflers"
     )
 
     # Posting Results: queried directly from benivo.post_log by run_id --
@@ -1169,6 +1271,7 @@ def generate_reports(
     ready_to_post_count = len(ready_to_post_rows)
     pending_office_mapping_count = len(pending_office_mapping_population)
     pending_recruiter_review_count = len(relocation_no) + len(relocation_unrecognized)
+    excluded_mobility_support_count = len(excluded_mobility_support_population)
 
     if sync_metrics is None:
         candidates_synced_display: Any = "N/A (sync not run this execution)"
@@ -1191,6 +1294,7 @@ def generate_reports(
         ("Failed", _count_with_pct(posting_failed, posting_attempted)),
         ("Pending Recruiter Review", _count_with_pct(pending_recruiter_review_count, total_candidates)),
         ("Pending Office Mapping", _count_with_pct(pending_office_mapping_count, total_candidates)),
+        ("Excluded - Mobility Support", _count_with_pct(excluded_mobility_support_count, total_candidates)),
         ("Country Source Distribution", SECTION_HEADER),
         ("Candidate Home Country", _count_with_pct(country_source_counts[SOURCE_CANDIDATE_HOME_COUNTRY], len(relocation_yes))),
         ("Current Location Fallback", _count_with_pct(country_source_counts[SOURCE_CURRENT_LOCATION], len(relocation_yes))),
@@ -1198,9 +1302,10 @@ def generate_reports(
         ("Start Date Distribution", SECTION_HEADER),
         ("Jobvite Start Date", _count_with_pct(jobvite_start_date_count, len(relocation_yes))),
         ("Calculated Start Date", _count_with_pct(calculated_start_date_count, len(relocation_yes))),
-        ("Mobility VIP Distribution", SECTION_HEADER),
-        ("Tier 1", _count_with_pct(mobility_vip_tier_1_count, len(relocation_yes))),
-        ("Tier 2", _count_with_pct(mobility_vip_tier_2_count, len(relocation_yes))),
+        ("Benivo Population Distribution", SECTION_HEADER),
+        ("Tier 1", _count_with_pct(population_tier_1_count, len(relocation_yes))),
+        ("Tier 3", _count_with_pct(population_tier_3_count, len(relocation_yes))),
+        ("Game Presenters and Shufflers", _count_with_pct(population_game_presenters_and_shufflers_count, len(relocation_yes))),
         ("Data Quality", SECTION_HEADER),
         ("Office Mapping Completeness", _pct(ready_to_post_count, ready_to_post_count + pending_office_mapping_count)),
         ("Home Country Completeness (Effective, Ready To Post)", _pct(ready_to_post_count - ready_missing_home_country, ready_to_post_count)),
@@ -1254,6 +1359,9 @@ def generate_reports(
     if relocation_review_rows:
         _write_table_sheet(wb.create_sheet("Pending Recruiter Review"), relocation_review_rows, banner_text=banner_text)
 
+    if excluded_scope_rows:
+        _write_table_sheet(wb.create_sheet("Excluded - Benivo Scope"), excluded_scope_rows, banner_text=banner_text)
+
     if country_data_issue_rows:
         _write_table_sheet(
             wb.create_sheet("Country Data Issues"),
@@ -1276,11 +1384,13 @@ def generate_reports(
 
     logger.info(
         "Report generated: %s (ready_to_post=%d, pending_office_mapping=%d, pending_recruiter_review=%d, "
-        "country_data_issues=%d, posting_results=%d, terminal_already_processed=%d, terminal_in_ready_population=%d).",
+        "excluded_mobility_support=%d, country_data_issues=%d, "
+        "posting_results=%d, terminal_already_processed=%d, terminal_in_ready_population=%d).",
         report_path,
         ready_to_post_count,
         pending_office_mapping_count,
         pending_recruiter_review_count,
+        excluded_mobility_support_count,
         len(country_data_issue_rows),
         len(posting_results_rows),
         terminal_already_processed,
@@ -1294,13 +1404,15 @@ def generate_reports(
         "failed": posting_failed,
         "pending_recruiter_review": pending_recruiter_review_count,
         "pending_office_mapping": pending_office_mapping_count,
+        "excluded_mobility_support": excluded_mobility_support_count,
         "country_fallback": country_source_counts[SOURCE_CURRENT_LOCATION],
         "go_live_pre_backlog": go_live_pre_backlog_count,
         "go_live_newly_eligible": go_live_newly_eligible_count,
         "go_live_automatically_eligible": go_live_auto_eligible_count,
         "go_live_already_posted": go_live_already_posted_count,
-        "mobility_vip_tier_1": mobility_vip_tier_1_count,
-        "mobility_vip_tier_2": mobility_vip_tier_2_count,
+        "population_tier_1": population_tier_1_count,
+        "population_tier_3": population_tier_3_count,
+        "population_game_presenters_and_shufflers": population_game_presenters_and_shufflers_count,
     }
 
     return report_path, report_metrics
