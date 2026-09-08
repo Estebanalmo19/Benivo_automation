@@ -182,3 +182,55 @@ def test_sync_candidates_returns_marked_no_longer_eligible_not_removed():
 
     assert "marked_no_longer_eligible" in metrics
     assert "removed" not in metrics
+
+
+# ---------------------------------------------------------------------------
+# agency_name (confirmed 2026-09-08, Mihai/Mobility business request):
+# source-owned, extracted only when application.sourceType='Agency', tested
+# the same way every other SQL-embedded, source-owned extraction column in
+# this UPSERT already is (home_country, current_country) -- SQL-shape
+# assertions against the real CASE expression, since the extraction itself
+# runs inside the UPSERT, not a separately callable Python function.
+# ---------------------------------------------------------------------------
+
+def test_upsert_sql_inserts_and_refreshes_agency_name():
+    sql = synchronization_service._UPSERT_SQL
+
+    insert_columns = sql.split("INSERT INTO benivo.candidates (")[1].split(")")[0]
+    assert "agency_name" in insert_columns
+    assert "agency_name = EXCLUDED.agency_name" in sql.split("DO UPDATE SET")[1]
+
+
+def test_upsert_sql_agency_name_only_extracted_when_source_type_is_agency():
+    # "agency candidate gets correct Agency Name": the CASE expression's
+    # THEN branch pulls application.source only inside the
+    # sourceType='Agency' WHEN clause.
+    sql = synchronization_service._UPSERT_SQL
+    case_expr = sql.split("AS agency_name")[0].split("CASE")[-1]
+
+    assert "sourceType" in case_expr
+    assert "'Agency'" in case_expr
+    assert "->>'source'" in case_expr
+
+
+def test_upsert_sql_agency_name_defaults_to_null_for_non_agency_source_types():
+    # "direct/LinkedIn/referral/etc. candidate does not get a fake agency":
+    # every sourceType other than the literal 'Agency' match falls through
+    # to the ELSE NULL branch -- there is no second WHEN clause that could
+    # catch Job board/Referral/Internal/Sourcing/etc.
+    sql = synchronization_service._UPSERT_SQL
+    case_expr = sql.split("AS agency_name")[0].split("CASE")[-1]
+
+    when_clauses = case_expr.count("WHEN")
+    assert when_clauses == 1  # exactly one condition (sourceType = 'Agency'), no others
+    assert "ELSE NULL" in case_expr
+
+
+def test_upsert_sql_agency_name_blank_source_becomes_null_not_empty_string():
+    # "null agency handled safely": NULLIF(...,'') mirrors the same
+    # blank-handling pattern current_country already uses.
+    sql = synchronization_service._UPSERT_SQL
+    case_expr = sql.split("AS agency_name")[0].split("CASE")[-1]
+
+    assert "NULLIF(" in case_expr
+    assert "->>'source', ''" in case_expr

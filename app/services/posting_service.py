@@ -282,6 +282,18 @@ def build_benivo_payload(
     investigation that candidate_home_country alone leaves real gaps
     current_country reliably fills. See build_case_update_payload(), which
     uses the exact same resolution for homeLocation.country.
+
+    Agency Name (Mihai/Mobility business request, confirmed 2026-09-08 --
+    Benivo scheduled reporting for recruiting agencies): the Jobvite-side
+    value is ready (candidate.get("agency_name"), populated only when
+    application.sourceType='Agency' -- see synchronization_service.py),
+    but deliberately NOT sent here. Benivo has not confirmed a destination
+    for it at all -- not the property name, not even which endpoint
+    (Create User, Case PATCH, a custom-fields object, or something else
+    entirely). Encoding a guessed key/endpoint here would silently assume
+    an unconfirmed integration contract. See app/services/reporting_service.py
+    for where this value is currently surfaced instead (data-prepared,
+    API-disabled).
     """
     _, population_api_value = resolve_population_values(candidate.get("dealer_shuffler"), candidate.get("is_vip"))
     effective_home_country, _home_country_source = resolve_effective_home_country(candidate)

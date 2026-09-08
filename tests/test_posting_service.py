@@ -1066,3 +1066,31 @@ def test_select_postable_candidates_passes_limit_through_to_sql(monkeypatch):
         posting.select_postable_candidates()
 
     assert captured["limit"] == 5
+
+
+# ---------------------------------------------------------------------------
+# build_benivo_payload() -- agency_name is deliberately NEVER sent
+# (confirmed 2026-09-08, Mihai/Mobility business request): Benivo has not
+# confirmed a destination for Agency Name at all -- not a property name,
+# not even which endpoint. Data-prepared (see synchronization_service.py/
+# reporting_service.py), API-disabled. This must hold even when the
+# candidate dict carries a real agency_name value, so the real Benivo
+# Create User payload stays byte-for-byte unchanged.
+# ---------------------------------------------------------------------------
+
+def test_build_benivo_payload_never_includes_agency_name():
+    candidate = {
+        "first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False,
+        "agency_name": "Randstad Romania",
+    }
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    # Exactly the 8 confirmed Create User keys -- no agency key under any
+    # name, and the agency value itself never leaks into any other field.
+    assert set(payload.keys()) == {
+        "firstName", "lastName", "email", "policy", "officeId", "officeName",
+        "startDateOfAssignment", "homeCountry",
+    }
+    assert "Randstad Romania" not in payload.values()

@@ -50,7 +50,7 @@ READY_CANDIDATE_FIELDS = f"""
     c.phone_number, c.location, c.population, c.vip, c.is_vip, c.gender,
     c.home_country, c.home_state_province, c.home_city, c.country_of_birth,
     c.citizenship, c.employee_id, c.billing_entity, c.host_legal_entity,
-    c.host_business_unit, c.current_country,
+    c.host_business_unit, c.current_country, c.agency_name,
     {DEALER_SHUFFLER_SUBQUERY}
 """
 
@@ -58,7 +58,7 @@ REPORTING_FIELDS = f"""
     c.id, c.application_eid, c.candidate_eid, c.email, c.first_name, c.last_name,
     c.job_title, c.requisition_id, c.workplace, c.host_country, c.host_city,
     c.start_date, c.benivo_status, c.created_at, c.updated_at,
-    c.is_vip, c.home_country, c.current_country,
+    c.is_vip, c.home_country, c.current_country, c.agency_name,
     {DEALER_SHUFFLER_SUBQUERY},
     {MOBILITY_SUPPORT_SUBQUERY}
 """
@@ -68,7 +68,7 @@ FULL_REPORT_FIELDS = f"""
     c.workflow_state, c.is_relocation_required, c.start_date, c.workplace,
     c.job_title, c.requisition_id, c.department, c.location, c.benivo_status,
     c.is_vip, c.home_country, c.home_city, c.phone_number, c.benivo_assignment_id,
-    c.current_country, c.created_at, c.updated_at,
+    c.current_country, c.agency_name, c.created_at, c.updated_at,
     {DEALER_SHUFFLER_SUBQUERY},
     {MOBILITY_SUPPORT_SUBQUERY}
 """

@@ -204,6 +204,7 @@ READY_TO_POST_COLUMNS = [
     "Mobility VIP",
     "Mobility Support",
     "Benivo Population",
+    "Agency",
     "Scope Eligibility",
     "Original Start Date",
     "Effective Start Date",
@@ -236,6 +237,7 @@ PAYLOAD_PREVIEW_COLUMNS = [
     "current_country",
     "home_country_source",
     "home_city",
+    "agency_name",
     # Start-date data
     "original_jobvite_start_date",
     "effective_start_date",
@@ -609,6 +611,12 @@ def _build_ready_to_post_row(
         # no confirmed "VIP Status" column here -- see this workbook's
         # Instructions sheet.
         "Benivo Population": population_api_value,
+        # Jobvite-sourced (application.sourceType='Agency' -> application.source
+        # -- see synchronization_service.py). Blank for the large majority of
+        # candidates, who are not agency-sourced -- that's correct, not a
+        # data-quality gap. Not yet sent to Benivo (destination field pending
+        # Gina/Benivo confirmation) -- shown for reporting/audit only.
+        "Agency": candidate.get("agency_name"),
         # Independently recomputed via mobility_scope_service.resolve_scope()
         # -- always "Yes" here (READY_TO_POST already implies it), shown for
         # a consistent column set with the exception sheets.
@@ -695,6 +703,13 @@ def _build_payload_preview_row(
         "current_country": candidate.get("current_country"),
         "home_country_source": home_country_source,
         "home_city": candidate.get("home_city"),
+        # Jobvite-sourced (application.sourceType='Agency' -> application.source
+        # -- see synchronization_service.py), NULL for every non-agency-sourced
+        # candidate (the large majority). Not part of the create_*/case_*
+        # sections below: the Benivo-side destination field/key is not yet
+        # confirmed (Gina/Benivo pending), so this value is not sent anywhere
+        # today -- shown here purely so ops can already see it's ready.
+        "agency_name": candidate.get("agency_name"),
         "original_jobvite_start_date": _excel_safe(candidate.get("start_date")),
         "effective_start_date": _excel_safe(effective_start_date),
         "start_date_source": start_date_source,
@@ -1361,6 +1376,14 @@ def generate_reports(
     pending_recruiter_review_count = len(relocation_no) + len(relocation_unrecognized)
     excluded_mobility_support_count = len(excluded_mobility_support_population)
     no_longer_eligible_count = len(no_longer_eligible_population)
+    # Mihai/Mobility business request, confirmed 2026-09-08: a single
+    # count, not a full per-agency breakdown table -- a breakdown would add
+    # sheet clutter for a value most candidates simply don't have (see
+    # agency_name's own comment), while this one number already answers
+    # the practical question ("how many of what we're about to post came
+    # through an agency") without repeating the per-candidate "Agency"
+    # column already on the Ready To Post sheet.
+    agency_sourced_ready_to_post_count = sum(1 for c in ready_to_post_population if c.get("agency_name"))
 
     if sync_metrics is None:
         candidates_synced_display: Any = "N/A (sync not run this execution)"
@@ -1390,6 +1413,7 @@ def generate_reports(
         ("Pending Office Mapping", _count_with_pct(pending_office_mapping_count, total_candidates)),
         ("Excluded - Mobility Support", _count_with_pct(excluded_mobility_support_count, total_candidates)),
         ("No Longer Eligible (Jobvite workflow moved on)", _count_with_pct(no_longer_eligible_count, total_candidates)),
+        ("Agency-Sourced (Ready To Post)", _count_with_pct(agency_sourced_ready_to_post_count, ready_to_post_count)),
         ("Country Source Distribution", SECTION_HEADER),
         ("Candidate Home Country", _count_with_pct(country_source_counts[SOURCE_CANDIDATE_HOME_COUNTRY], len(relocation_yes))),
         ("Current Location Fallback", _count_with_pct(country_source_counts[SOURCE_CURRENT_LOCATION], len(relocation_yes))),

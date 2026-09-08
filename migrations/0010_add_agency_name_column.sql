@@ -1,0 +1,49 @@
+-- Add benivo.candidates.agency_name: the recruiting agency name for
+-- candidates sourced through one, derived from Jobvite's own native
+-- application.sourceType / application.source fields (NOT a custom field
+-- -- confirmed 2026-09-08 by direct inspection of
+-- jv_arrise_data_schema.jobvite_applications.raw_payload; no customField
+-- named "agency"/"recruiting_agency"/"vendor" exists anywhere in the data).
+--
+-- Business context (Mihai, 2026-09-08): Benivo is implementing scheduled
+-- reports for recruiting agencies; Gina (Benivo) has been asked to create
+-- a destination field on the Benivo side, not yet confirmed as of this
+-- migration. This column is the Jobvite-side/data-model half of that
+-- request only -- see app/services/synchronization_service.py for the
+-- extraction rule and app/services/posting_service.py for why the Benivo
+-- payload itself does NOT yet send this value (blocked behind
+-- config.benivo_agency_field_name(), unset until Gina confirms the real
+-- Benivo API property name -- guessing one risks the same silent-rejection
+-- failure mode "policy": "Basic" caused before "Tier 1" was confirmed).
+--
+-- Rule (confirmed against real data, 2026-09-08): application.sourceType
+-- is a clean, controlled Jobvite enum ("Job board", "Career site",
+-- "Referral", "Agency", "Sourcing", "Internal", ...). application.source is
+-- free text whose MEANING depends entirely on sourceType -- it is the job
+-- board name when sourceType="Job board" (LinkedIn, Indeed, ...), an
+-- ARRISE TA team member's own name when sourceType="Sourcing" (confirmed
+-- by sampling: e.g. an internal recruiter's name appears there), an
+-- internal HiBob employee reference when sourceType="Referral", and only
+-- the actual submitting recruiting agency/contact name when
+-- sourceType="Agency" (confirmed by sampling real values: "Sofia Astrea
+-- Recruitment LTD", "Randstad Romania", "GRS Recruit", ...). Therefore:
+-- agency_name = source ONLY WHEN sourceType = 'Agency', else NULL --
+-- never derived from source alone, which would incorrectly capture
+-- LinkedIn/Referral/Internal/Indeed/etc. as if they were agencies.
+--
+-- Deliberately a materialized column, refreshed every sync, not a
+-- read-time JSON subquery on source_payload (which already stores the
+-- full raw Jobvite payload) -- same precedent as home_country/workplace/
+-- start_date (see synchronization_service.py's own comment on why those
+-- are source-owned columns): needed consistently by reporting and by the
+-- (currently blocked) posting payload, and this way it's never
+-- re-derived redundantly on every read. Not duplication of source_payload
+-- -- agency_name is a normalized, business-rule-applied extraction, the
+-- same relationship home_country already has to source_payload.
+--
+-- Non-destructive: ADD COLUMN IF NOT EXISTS is idempotent, nullable (most
+-- candidates are not agency-sourced and will have NULL here, which is
+-- correct, not a data-quality gap).
+
+ALTER TABLE benivo.candidates
+    ADD COLUMN IF NOT EXISTS agency_name TEXT;

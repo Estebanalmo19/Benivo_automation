@@ -27,6 +27,7 @@ def _candidate(
     benivo_assignment_id=None,
     dealer_shuffler=None,
     mobility_support=None,
+    agency_name=None,
 ):
     return {
         "application_eid": application_eid,
@@ -38,6 +39,7 @@ def _candidate(
         "workflow_state": workflow_state,
         "is_relocation_required": is_relocation_required,
         "start_date": start_date,
+        "agency_name": agency_name,
         "workplace": workplace,
         "job_title": job_title,
         "requisition_id": "REQ-1",
@@ -236,6 +238,22 @@ def test_build_ready_to_post_row_shows_mobility_support():
     assert row["Mobility Support"] == "Relocation\nAccommodation"
 
 
+def test_build_ready_to_post_row_shows_agency_name_for_agency_sourced_candidate():
+    # "agency candidate gets correct Agency Name"
+    row = reporting._build_ready_to_post_row(
+        _complete_candidate(agency_name="Randstad Romania"), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True
+    )
+
+    assert row["Agency"] == "Randstad Romania"
+
+
+def test_build_ready_to_post_row_agency_blank_for_non_agency_candidate():
+    # "direct candidate does not get a fake agency" / "null agency handled safely"
+    row = reporting._build_ready_to_post_row(_complete_candidate(agency_name=None), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True)
+
+    assert row["Agency"] is None
+
+
 def test_build_ready_to_post_row_scope_eligibility_yes_when_qualifying():
     row = reporting._build_ready_to_post_row(
         _complete_candidate(mobility_support="Relocation"), _OFFICE, EXECUTION_TIMESTAMP, payload_ready=True
@@ -302,6 +320,18 @@ def test_build_ready_to_post_row_unresolved_office_leaves_office_fields_none():
 def test_build_payload_preview_row_has_all_columns():
     row = reporting._build_payload_preview_row(_complete_candidate(), _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set())
     assert set(row.keys()) == set(reporting.PAYLOAD_PREVIEW_COLUMNS)
+
+
+def test_build_payload_preview_row_shows_agency_name_as_source_data_only():
+    # agency_name is shown for audit/reporting even though it is NOT part
+    # of the create_*/case_* sections -- Benivo has not confirmed any
+    # destination for it (see posting_service.build_benivo_payload()).
+    row = reporting._build_payload_preview_row(
+        _complete_candidate(agency_name="GRS Recruit"), _OFFICE, EXECUTION_TIMESTAMP, selected=False, terminal_eids=set()
+    )
+
+    assert row["agency_name"] == "GRS Recruit"
+    assert "GRS Recruit" not in [row.get(k) for k in row if k.startswith("create_")]
 
 
 def test_build_payload_preview_row_create_payload_matches_posting_service_builder():
@@ -1080,3 +1110,26 @@ def test_generate_reports_selected_count_never_exceeds_limit(tmp_path, monkeypat
     reporting.generate_reports(selected_candidates=selected, dry_run=True, posting_limit=5, run_id="run-1")
 
     assert len(selected) <= 5
+
+
+def test_generate_reports_agency_sourced_metric_and_ready_to_post_column(tmp_path, monkeypatch):
+    # End-to-end: Executive Summary's "Agency-Sourced (Ready To Post)" count
+    # and the Ready To Post sheet's "Agency" column must agree with the
+    # underlying candidate data -- one agency-sourced, one direct.
+    population = [
+        _candidate("READY-AGENCY", benivo_status="READY_TO_POST", home_country="Serbia", agency_name="Randstad Romania"),
+        _candidate("READY-DIRECT", benivo_status="READY_TO_POST", home_country="Serbia", agency_name=None),
+    ]
+    _patch_common(monkeypatch, tmp_path, population)
+
+    report_path, _metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    summary = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
+    assert summary["Agency-Sourced (Ready To Post)"] == "1 (50.0%)"
+
+    headers = [c.value for c in wb["Ready To Post"][2]]
+    agency_col = headers.index("Agency")
+    rows_by_eid = {row[0]: row for row in wb["Ready To Post"].iter_rows(min_row=3, values_only=True)}
+    assert rows_by_eid["READY-AGENCY"][agency_col] == "Randstad Romania"
+    assert rows_by_eid["READY-DIRECT"][agency_col] is None

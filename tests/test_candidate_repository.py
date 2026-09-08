@@ -314,3 +314,21 @@ def test_get_workplace_and_first_seen_returns_rows_as_dicts():
         result = candidate_repository.get_workplace_and_first_seen(["APP-1"])
 
     assert result == rows
+
+
+# ---------------------------------------------------------------------------
+# agency_name field-list inclusion (confirmed 2026-09-08, Mihai/Mobility
+# business request) -- must flow into posting (READY_CANDIDATE_FIELDS) and
+# every report field set, same as home_country already does.
+# ---------------------------------------------------------------------------
+
+def test_ready_candidate_fields_includes_agency_name():
+    assert "c.agency_name" in candidate_repository.READY_CANDIDATE_FIELDS
+
+
+def test_reporting_fields_includes_agency_name():
+    assert "c.agency_name" in candidate_repository.REPORTING_FIELDS
+
+
+def test_full_report_fields_includes_agency_name():
+    assert "c.agency_name" in candidate_repository.FULL_REPORT_FIELDS

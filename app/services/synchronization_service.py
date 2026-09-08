@@ -69,6 +69,25 @@ DEFAULT_BENIVO_STATUS = "PENDING"
 #     source only; app/services/home_country_service.py resolves the
 #     effective value candidates/postings actually use. home_country itself
 #     is never overwritten by this fallback.
+#   agency_name   <- application.sourceType / application.source (Jobvite's
+#     own native ATS fields, NOT a customField -- confirmed 2026-09-08:
+#     no customField named agency/recruiting_agency/vendor exists anywhere
+#     in the data). sourceType is a clean, controlled enum ("Job board",
+#     "Career site", "Referral", "Agency", "Sourcing", "Internal", ...);
+#     source is free text whose MEANING depends entirely on sourceType --
+#     confirmed by sampling real values: the job board name when
+#     sourceType="Job board" (LinkedIn, Indeed, ...), an ARRISE TA team
+#     member's own name when sourceType="Sourcing", an internal HiBob
+#     reference when sourceType="Referral", and only the actual submitting
+#     agency/contact name when sourceType="Agency" (e.g. "Randstad Romania",
+#     "GRS Recruit"). So agency_name = source ONLY when sourceType='Agency',
+#     else NULL -- never derived from source alone, which would incorrectly
+#     capture LinkedIn/Referral/Internal/etc. as if they were agencies. See
+#     migrations/0010_add_agency_name_column.sql for the full investigation.
+#     Business context: Mihai/Mobility, 2026-09-08 -- Benivo scheduled
+#     reporting for recruiting agencies; the Benivo-side destination field
+#     is not yet confirmed (see posting_service.py), this is the Jobvite/
+#     data-model half only.
 # host_country, host_city, population, vip have NO confirmed source field
 # anywhere in jv_arrise_data_schema.jobvite_applications (application
 # customFields, job customFields, and top-level candidate/application keys
@@ -92,6 +111,7 @@ INSERT INTO benivo.candidates (
     home_country,
     current_country,
     is_vip,
+    agency_name,
     source_payload,
     benivo_status,
     updated_at
@@ -136,6 +156,11 @@ SELECT
         ) = 'Yes',
         FALSE
     ) AS is_vip,
+    CASE
+        WHEN j.raw_payload->'application'->>'sourceType' = 'Agency'
+        THEN NULLIF(j.raw_payload->'application'->>'source', '')
+        ELSE NULL
+    END AS agency_name,
     j.raw_payload,
     %(default_status)s,
     NOW()
@@ -164,6 +189,7 @@ DO UPDATE SET
     home_country = EXCLUDED.home_country,
     current_country = EXCLUDED.current_country,
     is_vip = EXCLUDED.is_vip,
+    agency_name = EXCLUDED.agency_name,
     source_payload = EXCLUDED.source_payload,
     updated_at = NOW();
 """

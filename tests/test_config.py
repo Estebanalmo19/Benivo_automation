@@ -84,3 +84,5 @@ def test_go_live_at_raises_on_malformed_value(monkeypatch):
     monkeypatch.setenv("BENIVO_GO_LIVE_AT", "not-a-date")
     with pytest.raises(ValueError):
         config.go_live_at()
+
+
