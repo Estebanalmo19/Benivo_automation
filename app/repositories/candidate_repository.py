@@ -287,6 +287,46 @@ def get_historical_batch_candidates(t0: datetime) -> List[Dict[str, Any]]:
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_workplace_and_first_seen(application_eids: List[str]) -> List[Dict[str, Any]]:
+    """
+    READ-ONLY lookup of workplace + first_seen_in_scope_at for an explicit,
+    already-known set of application_eids -- Change 3 of the UAT cutover
+    safeguards (confirmed 2026-09-08), used by
+    scripts/create_cutover_canary.py to group an existing approved-batch
+    file's members by workplace without ever selecting a candidate outside
+    that already-approved set.
+
+    Deliberately NOT a fresh eligibility query -- no benivo_status/
+    is_relocation_required/live-Jobvite/post_log filtering here. The
+    candidates this looks up were already selected (and will be
+    re-validated again, live, at actual selection time by
+    approved_batch_service.evaluate_approved_batch()) -- this is purely a
+    grouping-metadata lookup for a set the caller already trusts. Returns
+    only application_eid, workplace, and first_seen_in_scope_at -- no PII
+    column is ever selected. Rows are returned only for application_eids
+    that still have both a benivo.candidates row and a benivo.scope_history
+    row (INNER JOIN) -- an eid missing either is simply absent from the
+    result rather than erroring, so callers must handle a partial result.
+    """
+    if not application_eids:
+        return []
+
+    query = """
+        SELECT
+            c.application_eid,
+            c.workplace,
+            sh.first_seen_in_scope_at
+        FROM benivo.candidates c
+        JOIN benivo.scope_history sh ON sh.application_eid = c.application_eid
+        WHERE c.application_eid = ANY(%(application_eids)s)
+        ORDER BY sh.first_seen_in_scope_at, c.application_eid
+    """
+
+    with db_cursor() as cur:
+        cur.execute(query, {"application_eids": application_eids})
+        return [dict(row) for row in cur.fetchall()]
+
+
 def get_candidate_by_application_eid(application_eid: str) -> Optional[Dict[str, Any]]:
     """Fetch one candidate by application_eid regardless of eligibility -- used for explicit UAT candidate validation."""
     query = f"""

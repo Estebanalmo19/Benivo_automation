@@ -5,13 +5,17 @@ Usage:
     python -m app.main classify   -- re-classify benivo.candidates only
     python -m app.main report     -- generate the operational report only (never posts, regardless of BENIVO_DRY_RUN)
     python -m app.main post       -- select + post eligible candidates (respects BENIVO_DRY_RUN), then report
+    python -m app.main post --no-report-delivery
+                                   -- same posting behavior; the local Excel report is still generated,
+                                      but the Power Automate delivery attempt is skipped for this run only
     python -m app.main run        -- the full scheduled sequence: sync -> classify -> post -> report
 
 "run" is what a cron/systemd timer on the VM should call. The last two
 steps of "post"/"run" (post_log write + candidate status update) only
 execute when BENIVO_DRY_RUN=false. See .env.example for every supported
 setting, including the BENIVO_UAT_APPLICATION_EID safety override for a
-single explicitly-confirmed candidate.
+single explicitly-confirmed candidate and BENIVO_APPROVED_BATCH_FILE for
+a one-time explicit approved-batch override.
 """
 
 import argparse
@@ -92,6 +96,7 @@ def _generate_and_deliver_report(
     posting_limit: int,
     run_id: str,
     sync_metrics: Optional[Dict[str, Any]] = None,
+    deliver: bool = True,
 ):
     """
     The single orchestration boundary for "generate a report, then attempt
@@ -101,11 +106,27 @@ def _generate_and_deliver_report(
     concerns -- a delivery failure (see report_delivery_service.py) never
     affects the return value or raises, so it can never roll back or alter
     anything this function's caller already did.
+
+    deliver=False (confirmed 2026-09-08, UAT canary safeguard -- see
+    cmd_post()'s --no-report-delivery flag) skips calling
+    report_delivery_service.deliver_report() entirely -- the local Excel
+    report is still generated exactly as before (Option A: report
+    generation has no business side effects of its own, it only reads
+    already-committed state, so keeping it gives a local reconciliation
+    artifact after a canary even when delivery is suppressed). This is a
+    run-scoped override, completely independent of, and never mutating,
+    BENIVO_REPORT_DELIVERY_ENABLED -- when deliver=True (the default,
+    unchanged from before this flag existed), deliver_report() is called
+    exactly as always and still makes its own decision from that setting.
     """
     report_path, report_metrics = reporting_service.generate_reports(
         candidates, dry_run, posting_limit, run_id=run_id, sync_metrics=sync_metrics
     )
     logger.info("Report generated: %s", report_path)
+
+    if not deliver:
+        logger.info("REPORT_DELIVERY = DISABLED_FOR_THIS_RUN")
+        return report_path
 
     report_delivery_service.deliver_report(report_path, run_id, report_metrics)
 
@@ -131,9 +152,19 @@ def cmd_report(_args: argparse.Namespace) -> int:
 
 
 def cmd_post(args: argparse.Namespace) -> int:
+    """
+    --no-report-delivery (confirmed 2026-09-08, UAT canary safeguard):
+    posting behavior (selection, live safety gates, Create User, Case
+    PATCH, post_log writes, candidate status) is completely unaffected --
+    only whether the report this command always generates afterward is
+    also delivered to Power Automate. See _generate_and_deliver_report()'s
+    deliver parameter.
+    """
     run_id = str(uuid.uuid4())
     candidates, _results, dry_run, posting_limit = _select_and_post(run_id)
-    _generate_and_deliver_report(candidates, dry_run, posting_limit, run_id)
+    _generate_and_deliver_report(
+        candidates, dry_run, posting_limit, run_id, deliver=not args.no_report_delivery
+    )
     return 0
 
 
@@ -170,6 +201,16 @@ COMMANDS = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m app.main", description="Benivo Automation")
     parser.add_argument("command", choices=sorted(COMMANDS), help="Which step to run")
+    # Only cmd_post() reads this (see its docstring) -- accepted globally
+    # rather than via per-command subparsers, the smallest change that
+    # supports "python -m app.main post --no-report-delivery" without
+    # restructuring the existing flat single-positional-arg parser. Silently
+    # unused by every other command.
+    parser.add_argument(
+        "--no-report-delivery",
+        action="store_true",
+        help="post only: still generates the local Excel report, but skips the Power Automate delivery attempt for this invocation.",
+    )
     return parser
 
 

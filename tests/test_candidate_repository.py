@@ -258,3 +258,59 @@ def test_get_historical_batch_candidates_returns_rows_as_dicts():
         result = candidate_repository.get_historical_batch_candidates(t0)
 
     assert result == rows
+
+
+# ---------------------------------------------------------------------------
+# get_workplace_and_first_seen() -- Change 3 canary-generation lookup
+# (confirmed 2026-09-08): restricted to an explicit, caller-supplied
+# application_eid set, never an independent eligibility query.
+# ---------------------------------------------------------------------------
+
+def test_get_workplace_and_first_seen_restricts_to_given_eids():
+    context_manager, cursor = _fake_db_cursor()
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        candidate_repository.get_workplace_and_first_seen(["APP-1", "APP-2"])
+
+    sql, params = cursor.execute.call_args[0]
+    assert "c.application_eid = ANY(%(application_eids)s)" in sql
+    assert params["application_eids"] == ["APP-1", "APP-2"]
+
+
+def test_get_workplace_and_first_seen_orders_by_first_seen_then_eid():
+    context_manager, cursor = _fake_db_cursor()
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        candidate_repository.get_workplace_and_first_seen(["APP-1"])
+
+    sql, _params = cursor.execute.call_args[0]
+    assert "ORDER BY sh.first_seen_in_scope_at, c.application_eid" in sql
+
+
+def test_get_workplace_and_first_seen_selects_only_non_pii_columns():
+    context_manager, cursor = _fake_db_cursor()
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        candidate_repository.get_workplace_and_first_seen(["APP-1"])
+
+    sql, _params = cursor.execute.call_args[0]
+    for pii_column in ("email", "first_name", "last_name", "phone_number"):
+        assert pii_column not in sql
+
+
+def test_get_workplace_and_first_seen_empty_input_returns_empty_without_querying():
+    with patch("app.repositories.candidate_repository.db_cursor") as mock_db_cursor:
+        result = candidate_repository.get_workplace_and_first_seen([])
+
+    assert result == []
+    mock_db_cursor.assert_not_called()
+
+
+def test_get_workplace_and_first_seen_returns_rows_as_dicts():
+    rows = [{"application_eid": "APP-1", "workplace": "Serbia Live Casino", "first_seen_in_scope_at": "2026-08-24T21:14:39+00:00"}]
+    context_manager, cursor = _fake_db_cursor(rows)
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        result = candidate_repository.get_workplace_and_first_seen(["APP-1"])
+
+    assert result == rows
