@@ -29,6 +29,7 @@ from app.repositories.candidate_repository import (
     get_source_workflow_state,
 )
 from app.repositories.post_log_repository import get_terminal_post_log_application_eids, insert_post_log_row
+from app.services.approved_batch_service import select_approved_batch_candidates
 from app.services.country_code_service import resolve_iso2 as resolve_country_iso2
 from app.services.home_country_service import resolve_effective_home_country
 from app.services.office_resolution_service import resolve_office
@@ -66,12 +67,29 @@ def select_postable_candidates(limit: Optional[int] = None) -> List[Dict[str, An
     Normal path: READY_TO_POST candidates, oldest first, SQL-limited by
     BENIVO_MAX_CANDIDATES.
 
+    Approved-batch override (checked first, confirmed 2026-09-08): if
+    BENIVO_APPROVED_BATCH_FILE is set, selection is restricted to exactly
+    the explicit application_eids in that file, each individually
+    re-validated against every existing eligibility condition -- never a
+    LIMIT-based query. Deliberately separate from, and takes precedence
+    over, the single-candidate UAT override below (a different mechanism
+    for a different purpose -- see approved_batch_service.py's module
+    docstring for why neither BENIVO_GO_LIVE_AT nor
+    BENIVO_UAT_APPLICATION_EID could express "post exactly this
+    business-approved set"). Ignores BENIVO_MAX_CANDIDATES entirely -- the
+    batch file itself is the reviewed upper bound.
+
     Safety override: if BENIVO_UAT_APPLICATION_EID is set, selection is
     pinned to exactly that application_eid, fully re-validated against every
     eligibility condition (not just LIMIT 1). If it fails any check, this
     returns [] -- no posting happens and it never falls back to another
     candidate. See validate_uat_candidate() for the exact checks.
     """
+    approved_batch_file = config.approved_batch_file()
+
+    if approved_batch_file is not None:
+        return select_approved_batch_candidates(approved_batch_file)
+
     uat_application_eid = _get_uat_application_eid()
 
     if uat_application_eid is not None:

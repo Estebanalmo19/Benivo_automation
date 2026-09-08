@@ -58,6 +58,16 @@ def test_max_candidates_falls_back_on_invalid(monkeypatch):
     assert config.max_candidates() == 1
 
 
+def test_approved_batch_file_none_when_unset(monkeypatch):
+    monkeypatch.delenv("BENIVO_APPROVED_BATCH_FILE", raising=False)
+    assert config.approved_batch_file() is None
+
+
+def test_approved_batch_file_strips_whitespace(monkeypatch):
+    monkeypatch.setenv("BENIVO_APPROVED_BATCH_FILE", "  config/approved_batches/x.json  ")
+    assert config.approved_batch_file() == "config/approved_batches/x.json"
+
+
 def test_go_live_at_none_when_unset(monkeypatch):
     monkeypatch.delenv("BENIVO_GO_LIVE_AT", raising=False)
     assert config.go_live_at() is None

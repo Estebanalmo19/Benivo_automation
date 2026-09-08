@@ -105,6 +105,20 @@ def uat_application_eid() -> Optional[str]:
     return raw.strip() if raw and raw.strip() else None
 
 
+def approved_batch_file() -> Optional[str]:
+    """
+    Path to a one-time, version-controlled approved-application_eid batch
+    artifact (see app.services.approved_batch_service) -- confirmed
+    2026-09-08: a deliberate, separate mechanism from both
+    BENIVO_UAT_APPLICATION_EID (a single explicit candidate) and
+    BENIVO_GO_LIVE_AT (a time-based cutover). Unset by default -- while
+    unset, posting_service.select_postable_candidates() applies no batch
+    restriction at all (today's exact normal/UAT behavior, unchanged).
+    """
+    raw = os.getenv("BENIVO_APPROVED_BATCH_FILE")
+    return raw.strip() if raw and raw.strip() else None
+
+
 def go_live_at() -> Optional[datetime]:
     """
     Production go-live cutover, ISO 8601 (e.g. "2026-09-01T00:00:00Z").
