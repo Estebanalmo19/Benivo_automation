@@ -217,6 +217,76 @@ def get_all_candidates_for_report() -> List[Dict[str, Any]]:
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_historical_batch_candidates(t0: datetime) -> List[Dict[str, Any]]:
+    """
+    READ-ONLY listing of the pre-cutover historical backlog for a given T0
+    -- confirmed 2026-09-08, Phase 2 of the approved-batch UAT cutover
+    preparation. Deliberately the mirror image of get_ready_candidates()'s
+    go-live clause: that function selects
+    `first_seen_in_scope_at >= go_live_at` (who's newly, automatically
+    eligible); this one selects `first_seen_in_scope_at < t0` (who's
+    historical). The two are mutually exclusive and, once
+    BENIVO_GO_LIVE_AT is actually set to this same T0, collectively cover
+    every scope-entry time with no gap.
+
+    Every OTHER safety condition below is identical to, and must be kept in
+    sync with, get_ready_candidates()'s own WHERE clause (benivo_status,
+    is_relocation_required, a valid application_eid, the live Jobvite
+    workflow re-check, the terminal post_log exclusion) -- this function
+    grants no exception to any of those, it only changes which scope-entry
+    time window is being asked about. Requires an actual benivo.scope_history
+    row (INNER JOIN, not LEFT JOIN) -- exactly like get_ready_candidates()'s
+    own EXISTS check, a candidate with no recorded first_seen_in_scope_at is
+    conservatively excluded rather than assumed historical.
+
+    Returns only application_eid, workplace, and first_seen_in_scope_at --
+    deliberately not the full candidate row -- so this listing never
+    fetches (and therefore can never leak) name/email/phone/any other PII,
+    consistent with this being a read-only pre-cutover population check,
+    never a posting or report path. ORDER BY first_seen_in_scope_at,
+    application_eid for deterministic, reproducible output.
+    """
+    query = """
+        SELECT
+            c.application_eid,
+            c.workplace,
+            sh.first_seen_in_scope_at
+        FROM benivo.candidates c
+        JOIN benivo.scope_history sh ON sh.application_eid = c.application_eid
+        WHERE c.benivo_status = 'READY_TO_POST'
+          AND c.is_relocation_required = 'Yes'
+          AND c.application_eid IS NOT NULL
+          AND BTRIM(c.application_eid) <> ''
+          AND sh.first_seen_in_scope_at < %(t0)s
+          AND EXISTS (
+              SELECT 1
+              FROM jv_arrise_data_schema.jobvite_applications j
+              WHERE j.application_eid = c.application_eid
+                AND j.workflow_state = %(mobility_workflow_state)s
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM benivo.post_log pl
+              WHERE pl.application_eid = c.application_eid
+                AND pl.action = %(create_user_action)s
+                AND pl.status = ANY(%(terminal_statuses)s)
+          )
+        ORDER BY sh.first_seen_in_scope_at, c.application_eid
+    """
+
+    with db_cursor() as cur:
+        cur.execute(
+            query,
+            {
+                "t0": t0,
+                "mobility_workflow_state": MOBILITY_WORKFLOW_STATE,
+                "create_user_action": ACTION_CREATE_USER,
+                "terminal_statuses": list(TERMINAL_POST_LOG_STATUSES),
+            },
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
 def get_candidate_by_application_eid(application_eid: str) -> Optional[Dict[str, Any]]:
     """Fetch one candidate by application_eid regardless of eligibility -- used for explicit UAT candidate validation."""
     query = f"""

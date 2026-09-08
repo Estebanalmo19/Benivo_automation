@@ -1,3 +1,4 @@
+import datetime
 from unittest.mock import MagicMock, patch
 
 from app.repositories import candidate_repository
@@ -171,3 +172,89 @@ def test_reporting_fields_includes_dealer_shuffler_mobility_support_and_is_vip()
     assert "c.is_vip" in candidate_repository.REPORTING_FIELDS
     assert "c.home_country" in candidate_repository.REPORTING_FIELDS
     assert "c.current_country" in candidate_repository.REPORTING_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# get_historical_batch_candidates() -- Phase 2 read-only pre-cutover listing
+# (confirmed 2026-09-08): mirror image of get_ready_candidates()'s go-live
+# clause -- first_seen_in_scope_at < T0, never >= T0.
+# ---------------------------------------------------------------------------
+
+def test_get_historical_batch_candidates_uses_strictly_less_than_t0():
+    context_manager, cursor = _fake_db_cursor()
+    t0 = datetime.datetime(2026, 9, 8, 14, 0, 0, tzinfo=datetime.timezone.utc)
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        candidate_repository.get_historical_batch_candidates(t0)
+
+    sql, params = cursor.execute.call_args[0]
+    assert "first_seen_in_scope_at < %(t0)s" in sql
+    assert "first_seen_in_scope_at >=" not in sql
+    assert params["t0"] == t0
+
+
+def test_get_historical_batch_candidates_requires_scope_history_join_not_left_join():
+    context_manager, cursor = _fake_db_cursor()
+    t0 = datetime.datetime(2026, 9, 8, tzinfo=datetime.timezone.utc)
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        candidate_repository.get_historical_batch_candidates(t0)
+
+    sql, _params = cursor.execute.call_args[0]
+    assert "JOIN benivo.scope_history sh ON sh.application_eid = c.application_eid" in sql
+    assert "LEFT JOIN" not in sql
+
+
+def test_get_historical_batch_candidates_preserves_every_other_safety_gate():
+    context_manager, cursor = _fake_db_cursor()
+    t0 = datetime.datetime(2026, 9, 8, tzinfo=datetime.timezone.utc)
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        candidate_repository.get_historical_batch_candidates(t0)
+
+    sql, params = cursor.execute.call_args[0]
+    assert "c.benivo_status = 'READY_TO_POST'" in sql
+    assert "c.is_relocation_required = 'Yes'" in sql
+    assert "BTRIM(c.application_eid) <> ''" in sql
+    assert "j.workflow_state = %(mobility_workflow_state)s" in sql
+    assert params["mobility_workflow_state"] == "Mobility in process"
+    assert "pl.action = %(create_user_action)s" in sql
+    assert params["create_user_action"] == "CREATE_USER"
+    assert params["terminal_statuses"] == ["SUCCESS", "ALREADY_EXISTS"]
+
+
+def test_get_historical_batch_candidates_orders_by_first_seen_then_eid():
+    context_manager, cursor = _fake_db_cursor()
+    t0 = datetime.datetime(2026, 9, 8, tzinfo=datetime.timezone.utc)
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        candidate_repository.get_historical_batch_candidates(t0)
+
+    sql, _params = cursor.execute.call_args[0]
+    assert "ORDER BY sh.first_seen_in_scope_at, c.application_eid" in sql
+
+
+def test_get_historical_batch_candidates_selects_only_non_pii_columns():
+    context_manager, cursor = _fake_db_cursor()
+    t0 = datetime.datetime(2026, 9, 8, tzinfo=datetime.timezone.utc)
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        candidate_repository.get_historical_batch_candidates(t0)
+
+    sql, _params = cursor.execute.call_args[0]
+    for pii_column in ("email", "first_name", "last_name", "phone_number"):
+        assert pii_column not in sql
+    assert "c.application_eid" in sql
+    assert "c.workplace" in sql
+    assert "sh.first_seen_in_scope_at" in sql
+
+
+def test_get_historical_batch_candidates_returns_rows_as_dicts():
+    rows = [{"application_eid": "APP-1", "workplace": "Serbia Live Casino", "first_seen_in_scope_at": "2026-08-24T21:14:39+00:00"}]
+    context_manager, cursor = _fake_db_cursor(rows)
+    t0 = datetime.datetime(2026, 9, 8, tzinfo=datetime.timezone.utc)
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        result = candidate_repository.get_historical_batch_candidates(t0)
+
+    assert result == rows
