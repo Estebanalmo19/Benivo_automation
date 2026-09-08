@@ -25,9 +25,12 @@ from app.models.domain import (
     ACTION_CREATE_USER,
     ACTION_UPDATE_CASE,
     EXCLUDED_MOBILITY_SUPPORT,
+    MOBILITY_WORKFLOW_STATE,
+    NO_LONGER_ELIGIBLE,
 )
 from app.repositories import candidate_repository, post_log_repository
 from app.services import mobility_scope_service, posting_service
+from app.services.country_code_service import resolve_iso2
 from app.services.home_country_service import (
     SOURCE_CANDIDATE_HOME_COUNTRY,
     SOURCE_CURRENT_LOCATION,
@@ -42,7 +45,14 @@ logger = logging.getLogger(__name__)
 
 REPORT_FILENAME_PREFIX = "benivo_operational_report"
 
-MOBILITY_WORKFLOW_STATE = "Mobility in process"
+# benivo_status values that mean a candidate will NEVER be posted to Benivo
+# for a business reason (as opposed to PENDING_*/NEEDS_RECRUITER_REVIEW,
+# which are still on track). Used to keep Country Data Warnings aligned
+# with actual Benivo scope -- confirmed 2026-09-07, extended 2026-09-08 with
+# NO_LONGER_ELIGIBLE (a source-eligibility exclusion, distinct from
+# EXCLUDED_MOBILITY_SUPPORT's business-scope exclusion -- see domain.py). A
+# future permanent exclusion status only needs to be added here, nowhere else.
+PERMANENTLY_EXCLUDED_SCOPE_STATUSES = {EXCLUDED_MOBILITY_SUPPORT, NO_LONGER_ELIGIBLE}
 
 # Go-live categories -- report-only labels computed on demand by
 # _go_live_category(), never stored anywhere (benivo_status is completely
@@ -146,8 +156,8 @@ GO_LIVE_STATUS_COLUMNS = [
 ]
 
 # Used by _build_row() -- Pending Office Mapping and Pending Recruiter
-# Review share this shape. Country Data Issues has its own dedicated shape
-# (see _build_country_data_issue_row()/COUNTRY_DATA_ISSUES_COLUMNS).
+# Review share this shape. Country Data Warnings has its own dedicated shape
+# (see _build_country_data_warning_row()/COUNTRY_DATA_WARNINGS_COLUMNS).
 REQUIRED_COLUMNS = [
     "application_eid",
     "candidate_eid",
@@ -287,21 +297,29 @@ POSTING_RESULTS_COLUMNS = [
     "Execution Time",
 ]
 
-# "Country Data Issues" (formerly "Missing Home Country") -- broader than
-# just missing: a candidate appears here if the country actually sent to
-# Benivo is missing OR came from the fallback (current_country) rather than
-# the primary source (candidate_home_country), so ops can immediately see
-# who's relying on a fallback value.
-COUNTRY_DATA_ISSUES_COLUMNS = [
+# "Country Data Warnings" (formerly "Country Data Issues"/"Missing Home
+# Country") -- broader than just missing: a candidate appears here if the
+# country actually used is missing OR came from the fallback
+# (current_country) rather than the primary source (candidate_home_country),
+# so ops can immediately see who's relying on a fallback value. A data
+# QUALITY warning, never a posting blocker -- see COUNTRY_ISSUE_FALLBACK_REASON.
+# Population is now aligned with Benivo scope (see generate_reports()):
+# candidates permanently excluded from scope (EXCLUDED_MOBILITY_SUPPORT)
+# never appear here, since fixing their country data would not make them
+# postable -- everyone still in scope or on track to be (READY_TO_POST,
+# PENDING_OFFICE_MAPPING, PENDING_MISSING_START_DATE, NEEDS_RECRUITER_REVIEW,
+# POSTED) can.
+COUNTRY_DATA_WARNINGS_COLUMNS = [
     "Application EID",
-    "Candidate Name",
-    "Workflow State",
+    "Candidate",
     "Candidate Home Country",
-    "Current Country",
-    "Country Sent to Benivo",
+    "Current Location",
+    "Effective Home Country",
     "Country Source",
-    "Reason",
-    "Operational Status",
+    "ISO2",
+    "Warning Reason",
+    "Scope Eligibility",
+    "Benivo Status",
 ]
 
 NOT_ATTEMPTED = "NOT_ATTEMPTED"
@@ -330,11 +348,23 @@ MISSING_OFFICE_REASON = "No confirmed Benivo office mapping exists for the candi
 # strings, reused here rather than duplicated, so classify()'s decision and
 # this report's explanation of it can never drift apart.
 MOBILITY_SUPPORT_EXCLUDED_REASON = mobility_scope_service.SCOPE_REASON_TEXT[mobility_scope_service.SCOPE_REASON_MOBILITY_SUPPORT]
+# Confirmed 2026-09-08: a candidate whose Jobvite workflow left "Mobility in
+# process" (Offer rescinded/rejected, Hired, Candidate withdrew, or any
+# other state) -- a SOURCE-eligibility exclusion, distinct from
+# MOBILITY_SUPPORT_EXCLUDED_REASON above (a business-scope exclusion for a
+# candidate who IS still in that workflow). The record itself is preserved,
+# never deleted -- see synchronization_service.py.
+NO_LONGER_ELIGIBLE_REASON = (
+    "Candidate's Jobvite workflow status is no longer \"Mobility in process\" -- the record is preserved "
+    "for traceability but is no longer eligible for Benivo posting."
+)
 COUNTRY_ISSUE_MISSING_REASON = (
-    "No country available from Jobvite -- both candidate_home_country and current_country are blank"
+    "Candidate Home Country and Current Location are both missing. No country is available. "
+    "This does not block Benivo posting."
 )
 COUNTRY_ISSUE_FALLBACK_REASON = (
-    "Using Jobvite's current-location country (current_country) as a fallback -- candidate_home_country is blank"
+    "Candidate Home Country is missing. Current Location is being used as fallback. "
+    "This does not block Benivo posting."
 )
 DRY_RUN_NOTE = "No real posting was performed (DRY RUN)."
 
@@ -438,27 +468,36 @@ def _build_row(
     }
 
 
-def _build_country_data_issue_row(candidate: Dict[str, Any]) -> Dict[str, Any]:
+def _build_country_data_warning_row(candidate: Dict[str, Any]) -> Dict[str, Any]:
     """
-    "Country Data Issues" row -- a candidate appears here (see generate_reports()'s
-    population filter) only when the country actually sent to Benivo is
-    missing, or came from the current_country fallback rather than the
-    primary candidate_home_country field, so ops can immediately see who's
-    relying on a fallback value.
+    "Country Data Warnings" row -- a candidate appears here (see
+    generate_reports()'s population filter) only when the effective country
+    is missing, or came from the Current Location fallback rather than the
+    primary Candidate Home Country field, so ops can immediately see who's
+    relying on a fallback value. A data-quality warning, never a posting
+    blocker on its own -- country resolution/ISO2 logic is unchanged, this
+    only surfaces which source was used.
+
+    Population is aligned with Benivo scope (see generate_reports()):
+    candidates permanently excluded from scope (EXCLUDED_MOBILITY_SUPPORT)
+    are filtered out before this is ever called -- fixing their country data
+    would not make them postable. Scope Eligibility/Benivo Status are shown
+    anyway for full audit context, exactly as on the other sheets.
     """
     effective_home_country, home_country_source = resolve_effective_home_country(candidate)
     reason = COUNTRY_ISSUE_MISSING_REASON if home_country_source == SOURCE_MISSING else COUNTRY_ISSUE_FALLBACK_REASON
 
     return {
         "Application EID": candidate.get("application_eid"),
-        "Candidate Name": _candidate_name(candidate),
-        "Workflow State": candidate.get("workflow_state"),
+        "Candidate": _candidate_name(candidate),
         "Candidate Home Country": candidate.get("home_country"),
-        "Current Country": candidate.get("current_country"),
-        "Country Sent to Benivo": effective_home_country,
+        "Current Location": candidate.get("current_country"),
+        "Effective Home Country": effective_home_country,
         "Country Source": home_country_source,
-        "Reason": reason,
-        "Operational Status": candidate.get("benivo_status"),
+        "ISO2": resolve_iso2(effective_home_country),
+        "Warning Reason": reason,
+        "Scope Eligibility": _resolve_scope_display(candidate)[0],
+        "Benivo Status": candidate.get("benivo_status"),
     }
 
 
@@ -946,46 +985,56 @@ def _write_instructions_sheet(ws: Worksheet, banner_text: str) -> None:
             "everyone about to be posted. Payload Preview: the exact technical fields the integration would send, "
             "plus data-quality flags -- use this to troubleshoot a specific candidate. Posting Results: what "
             "actually happened this run, read from the permanent audit log. Pending Office Mapping / Pending "
-            "Recruiter Review / Excluded - Benivo Scope / Country Data Issues: exception lists needing action "
-            "(only appear when non-empty). Go-Live Status: where each candidate sits relative to the production "
-            "go-live cutover.",
+            "Recruiter Review / Excluded - Benivo Scope / Country Data Warnings: exception lists needing "
+            "attention (only appear when non-empty). Go-Live Status: where each candidate sits relative to the "
+            "production go-live cutover.",
         ),
         (
-            "Meaning of the main statuses",
-            "READY_TO_POST: all requirements met, awaiting automatic posting. POSTED: successfully created in "
+            "Statuses",
+            "READY_TO_POST: everything needed is confirmed, awaiting posting. POSTED: successfully created in "
             "Benivo. POST_FAILED: a posting attempt failed and will be retried automatically. "
-            "PENDING_OFFICE_MAPPING: the Jobvite workplace has no confirmed Benivo office yet. "
-            "NEEDS_RECRUITER_REVIEW: relocation is not confirmed \"Yes\". EXCLUDED_MOBILITY_SUPPORT: "
-            "mobility_support does not include Relocation/Visa/work permit/Accommodation -- see \"Benivo Scope\" "
-            "below.",
+            "PENDING_OFFICE_MAPPING: the workplace has no confirmed Benivo office yet. NEEDS_RECRUITER_REVIEW: "
+            "relocation has not been confirmed \"Yes\". EXCLUDED_MOBILITY_SUPPORT: the candidate does not have a "
+            "qualifying Mobility Support selection -- see \"Benivo Scope\" below. NO_LONGER_ELIGIBLE: the "
+            "candidate's Jobvite status has moved on and they are no longer eligible for posting -- see "
+            "\"Jobvite Workflow Eligibility\" below.",
         ),
         (
-            "Dealer / Shuffler, Mobility VIP, Benivo Population",
-            "Population and VIP Status are separate Benivo concepts. \"Mobility VIP\" reflects Jobvite's own "
-            "mobility_vip field (Yes/No) and is shown for information only -- there is no confirmed Benivo API "
-            "field to send a standalone VIP Status, so it is never sent to Benivo under any field name. \"Dealer / "
-            "Shuffler\" is Jobvite's own job.customField[fieldCode='dealer__shuffler'] value, not Jobvite's Job "
-            "Title (HiBob/hr_work_title is no longer used for this). \"Benivo Population\" is the confirmed rule "
-            "(Mobility, 2026-09-04): dealer_shuffler is a controlled Jobvite selector -- ANY real catalog value "
-            "(\"Presenter\", \"Dealer\", \"Shuffler\", \"Gameshow host\", \"Prive Specialist Dealer\", or any "
-            "future catalog addition) -> \"Game Presenters and Shufflers\"; the field's own \"n/a\" placeholder "
-            "(meaning \"not a dealer/presenter/shuffler role\") and a missing value do NOT count -- otherwise "
-            "Mobility VIP = Yes -> \"Tier 1\"; otherwise -> \"Tier 3\". This value is sent to Benivo's create-user \"policy\" "
-            "field -- confirmed by real UAT evidence (2026-09-04) that the \"policy\" value is exactly what "
-            "appears as Population in the Benivo UI.",
+            "Benivo Scope",
+            "A candidate is in scope for Benivo when their Mobility Support answer includes Relocation, "
+            "Visa/work permit, or Accommodation -- any one of the three, or any combination, qualifies. "
+            "\"N/A\" on its own, a blank answer, or a missing answer does NOT qualify, and the candidate is "
+            "excluded (EXCLUDED_MOBILITY_SUPPORT). The \"Scope Eligibility\" column (Yes/No) shows this on every "
+            "relevant sheet. The \"Excluded - Benivo Scope\" sheet (only present when non-empty) lists exactly "
+            "who was excluded and why.",
         ),
         (
-            "Mobility Support and Benivo Scope",
-            "\"Mobility Support\" is Jobvite's own multi-select mobility_support value (e.g. \"Relocation / "
-            "Visa/work permit / Accommodation\", newline-separated in the raw data). A candidate is in Benivo "
-            "scope if and only if it includes Relocation, Visa/work permit, or Accommodation (any combination -- "
-            "\"N/A\" alone, blank, or missing does not qualify). This is the ONLY scope rule -- domestic/local "
-            "relocation (e.g. within Serbia, Romania, or Bulgaria) does NOT exclude a candidate on its own; a "
-            "domestic candidate with a qualifying Mobility Support selection is in scope exactly like an "
-            "international one, UAE included. \"Scope Eligibility\" (Yes/No) reflects this rule, recomputed "
-            "independently on every sheet -- so it can read \"No\" even on Pending Office Mapping/Pending "
-            "Recruiter Review rows that failed for a different reason too. See the \"Excluded - Benivo Scope\" "
-            "sheet (only present when non-empty) for exactly who was excluded and why.",
+            "Jobvite Workflow Eligibility",
+            "A candidate is only eligible for Benivo posting while their current Jobvite status is still "
+            "\"Mobility in process\". If a candidate later moves to any other status -- Offer rescinded, Offer "
+            "rejected, Hired, Candidate withdrew, or anything else -- they immediately stop being eligible and "
+            "are marked NO_LONGER_ELIGIBLE, even if they were previously READY_TO_POST. Their record is always "
+            "preserved for traceability, never deleted, and if a candidate genuinely returns to \"Mobility in "
+            "process\" later, they re-enter the normal review process automatically. As an extra safeguard, the "
+            "candidate's current Jobvite status is re-checked one final time immediately before any real posting "
+            "attempt, so a candidate can never be posted based on outdated information -- see the \"Excluded - "
+            "Benivo Scope\" sheet for exactly who is currently excluded this way and why.",
+        ),
+        (
+            "Domestic relocation",
+            "Domestic relocation (moving within the same country, e.g. within Serbia, Romania, or Bulgaria) is "
+            "NOT a reason to exclude a candidate. A domestic candidate with a qualifying Mobility Support "
+            "selection stays in scope exactly like an international one -- this includes domestic relocations "
+            "within the UAE.",
+        ),
+        (
+            "Benivo Population",
+            "Population and VIP Status are separate Benivo concepts. \"Mobility VIP\" is shown for information "
+            "only and is not sent to Benivo as a standalone value. \"Dealer / Shuffler\" is the candidate's role "
+            "type as selected in Jobvite. The confirmed Population rule: any valid Dealer / Shuffler selection "
+            "(e.g. Presenter, Dealer, Shuffler, Gameshow host, Prive Specialist Dealer, or any future addition to "
+            "that list) -> \"Game Presenters and Shufflers\". Otherwise, if Mobility VIP is \"Yes\" -> \"Tier 1\". "
+            "Otherwise -> \"Tier 3\".",
         ),
         (
             "Jobvite Start Date vs Calculated Start Date",
@@ -994,10 +1043,21 @@ def _write_instructions_sheet(ws: Worksheet, banner_text: str) -> None:
             "CALCULATED) so a candidate is never blocked purely for a missing date.",
         ),
         (
-            "Candidate Home Country vs Current Location fallback",
-            "The candidate's own declared home country is used whenever present. If it's blank, the automation "
-            "falls back to their current location country instead of leaving the field empty -- the \"Country "
-            "Source\" column on each sheet shows which one was actually used for a given candidate.",
+            "Home Country",
+            "The candidate's own declared Home Country is the primary source and is used whenever present. If "
+            "it's blank, the automation falls back to their Current Location instead of leaving the field empty "
+            "-- the \"Country Source\" column shows which one was actually used. This fallback is a data-quality "
+            "note, not by itself a reason a candidate can't be posted.",
+        ),
+        (
+            "Country Data Warnings",
+            "This sheet lists candidates whose Home Country is missing and Current Location was used as a "
+            "fallback (or, rarely, both are missing). These are data-quality warnings, not posting blockers -- a "
+            "candidate can appear on both the Ready To Post sheet and the Country Data Warnings sheet at the "
+            "same time. Only candidates who are still eligible, or on track to become eligible, for Benivo are "
+            "listed here; a candidate who is permanently out of Benivo scope for an unrelated reason (e.g. "
+            "EXCLUDED_MOBILITY_SUPPORT) is left off this sheet, since fixing their country data would not change "
+            "their eligibility.",
         ),
         (
             "Go-Live categories",
@@ -1147,6 +1207,13 @@ def generate_reports(
     ready_to_post_population = [c for c in mobility_candidates if c.get("benivo_status") == "READY_TO_POST"]
     pending_office_mapping_population = [c for c in mobility_candidates if c.get("benivo_status") == "PENDING_OFFICE_MAPPING"]
     excluded_mobility_support_population = [c for c in mobility_candidates if c.get("benivo_status") == EXCLUDED_MOBILITY_SUPPORT]
+    # Sourced from all_candidates, NOT mobility_candidates: a NO_LONGER_ELIGIBLE
+    # candidate's workflow_state is, by design, refreshed to whatever it
+    # actually is now (Offer rescinded, Hired, ...) -- see
+    # synchronization_service._MARK_OUT_OF_SCOPE_SQL -- so they no longer
+    # satisfy workflow_state == MOBILITY_WORKFLOW_STATE and would be missed
+    # entirely if sourced from mobility_candidates like the statuses above.
+    no_longer_eligible_population = [c for c in all_candidates if c.get("benivo_status") == NO_LONGER_ELIGIBLE]
 
     refdata = _fetch_refdata_if_allowed()
 
@@ -1187,36 +1254,57 @@ def generate_reports(
         for c in relocation_unrecognized
     ]
 
-    # "Excluded - Benivo Scope": candidates who confirmed relocation=Yes but
-    # were excluded by the confirmed mobility_support scope rule (see
-    # mobility_scope_service.py) -- distinct from Pending Office
+    # "Excluded - Benivo Scope": candidates excluded by one of the two
+    # conceptually distinct, permanent exclusion reasons (see
+    # PERMANENTLY_EXCLUDED_SCOPE_STATUSES) -- distinct from Pending Office
     # Mapping/Pending Recruiter Review, which are blocked on missing/
-    # unconfirmed data rather than a deliberate scope exclusion. Domestic/
-    # local relocation is NOT a scope exclusion (corrected 2026-09-05) --
-    # a domestic candidate with a qualifying mobility_support selection
-    # never appears here.
+    # unconfirmed data rather than a deliberate exclusion:
+    #   - EXCLUDED_MOBILITY_SUPPORT: still in Jobvite's Mobility workflow,
+    #     but no qualifying mobility_support selection (mobility_scope_service.py).
+    #   - NO_LONGER_ELIGIBLE: the Jobvite workflow itself has moved on
+    #     (synchronization_service.py) -- confirmed 2026-09-08.
+    # Domestic/local relocation is NOT a scope exclusion (corrected
+    # 2026-09-05) -- a domestic candidate with a qualifying mobility_support
+    # selection never appears here for that reason.
     excluded_scope_rows = [
         _build_row(c, MOBILITY_SUPPORT_EXCLUDED_REASON, execution_timestamp, selected=c.get("application_eid") in selected_eids)
         for c in excluded_mobility_support_population
+    ] + [
+        _build_row(c, NO_LONGER_ELIGIBLE_REASON, execution_timestamp, selected=c.get("application_eid") in selected_eids)
+        for c in no_longer_eligible_population
     ]
 
-    # Country Data Issues: independent of benivo_status -- includes
-    # READY_TO_POST candidates as well as any PENDING_OFFICE_MAPPING/POSTED
-    # candidate with a country issue, so the sheet and its Executive
-    # Summary counts always match exactly. A candidate lands here only if
-    # the EFFECTIVE country is missing, or came from the current_country
-    # fallback rather than the primary candidate_home_country field.
+    # Country Source Distribution (Executive Summary KPI only) -- unchanged
+    # scope (relocation_yes), unchanged country resolution/ISO2 logic.
     country_source_counts = {SOURCE_CANDIDATE_HOME_COUNTRY: 0, SOURCE_CURRENT_LOCATION: 0, SOURCE_MISSING: 0}
-    country_data_issue_candidates = []
 
     for candidate in relocation_yes:
         _effective_home_country, home_country_source = resolve_effective_home_country(candidate)
         country_source_counts[home_country_source] += 1
 
-        if home_country_source != SOURCE_CANDIDATE_HOME_COUNTRY:
-            country_data_issue_candidates.append(candidate)
+    # Country Data Warnings: population aligned with Benivo scope (confirmed
+    # 2026-09-07) -- every Mobility-in-process candidate EXCEPT those
+    # permanently excluded from Benivo scope (PERMANENTLY_EXCLUDED_SCOPE_STATUSES,
+    # currently just EXCLUDED_MOBILITY_SUPPORT), never the old
+    # is_relocation_required-based relocation_yes bucket. A NEEDS_RECRUITER_REVIEW
+    # candidate with a country fallback is now visible here (they may still
+    # confirm relocation and proceed); a candidate permanently excluded from
+    # scope for an unrelated reason no longer clutters this list, since
+    # fixing their country data would never make them postable. Country
+    # resolution/ISO2 logic itself is unchanged -- only which candidates are
+    # shown changed.
+    country_data_warning_candidates = []
 
-    country_data_issue_rows = [_build_country_data_issue_row(c) for c in country_data_issue_candidates]
+    for candidate in mobility_candidates:
+        if candidate.get("benivo_status") in PERMANENTLY_EXCLUDED_SCOPE_STATUSES:
+            continue
+
+        _effective_home_country, home_country_source = resolve_effective_home_country(candidate)
+
+        if home_country_source != SOURCE_CANDIDATE_HOME_COUNTRY:
+            country_data_warning_candidates.append(candidate)
+
+    country_data_warning_rows = [_build_country_data_warning_row(c) for c in country_data_warning_candidates]
 
     # Benivo Population distribution -- same population scope as Country
     # Source Distribution above (relocation_yes, not just READY_TO_POST) so
@@ -1272,13 +1360,19 @@ def generate_reports(
     pending_office_mapping_count = len(pending_office_mapping_population)
     pending_recruiter_review_count = len(relocation_no) + len(relocation_unrecognized)
     excluded_mobility_support_count = len(excluded_mobility_support_population)
+    no_longer_eligible_count = len(no_longer_eligible_population)
 
     if sync_metrics is None:
         candidates_synced_display: Any = "N/A (sync not run this execution)"
-        candidates_removed_display: Any = "N/A (sync not run this execution)"
+        candidates_marked_no_longer_eligible_display: Any = "N/A (sync not run this execution)"
     else:
         candidates_synced_display = sync_metrics.get("inserted_or_updated", "N/A")
-        candidates_removed_display = sync_metrics.get("removed", "N/A")
+        # "marked_no_longer_eligible" replaces the old sync_metrics "removed"
+        # key -- confirmed 2026-09-08: synchronization_service.py no longer
+        # deletes out-of-scope candidates, it transitions them in place (see
+        # synchronization_service._MARK_OUT_OF_SCOPE_SQL), so nothing is
+        # "removed" from benivo.candidates anymore.
+        candidates_marked_no_longer_eligible_display = sync_metrics.get("marked_no_longer_eligible", "N/A")
 
     summary_rows: List[Any] = [
         ("Run Information", SECTION_HEADER),
@@ -1287,7 +1381,7 @@ def generate_reports(
         ("Processing Summary", SECTION_HEADER),
         ("Total Candidates", total_candidates),
         ("Candidates Synced", candidates_synced_display),
-        ("Candidates Removed", candidates_removed_display),
+        ("Candidates Marked No Longer Eligible (this sync)", candidates_marked_no_longer_eligible_display),
         ("Ready To Post", _count_with_pct(ready_to_post_count, total_candidates)),
         ("Successfully Posted", _count_with_pct(posting_success, posting_attempted)),
         ("Already Exists", _count_with_pct(posting_already_exists, posting_attempted)),
@@ -1295,6 +1389,7 @@ def generate_reports(
         ("Pending Recruiter Review", _count_with_pct(pending_recruiter_review_count, total_candidates)),
         ("Pending Office Mapping", _count_with_pct(pending_office_mapping_count, total_candidates)),
         ("Excluded - Mobility Support", _count_with_pct(excluded_mobility_support_count, total_candidates)),
+        ("No Longer Eligible (Jobvite workflow moved on)", _count_with_pct(no_longer_eligible_count, total_candidates)),
         ("Country Source Distribution", SECTION_HEADER),
         ("Candidate Home Country", _count_with_pct(country_source_counts[SOURCE_CANDIDATE_HOME_COUNTRY], len(relocation_yes))),
         ("Current Location Fallback", _count_with_pct(country_source_counts[SOURCE_CURRENT_LOCATION], len(relocation_yes))),
@@ -1362,11 +1457,11 @@ def generate_reports(
     if excluded_scope_rows:
         _write_table_sheet(wb.create_sheet("Excluded - Benivo Scope"), excluded_scope_rows, banner_text=banner_text)
 
-    if country_data_issue_rows:
+    if country_data_warning_rows:
         _write_table_sheet(
-            wb.create_sheet("Country Data Issues"),
-            country_data_issue_rows,
-            columns=COUNTRY_DATA_ISSUES_COLUMNS,
+            wb.create_sheet("Country Data Warnings"),
+            country_data_warning_rows,
+            columns=COUNTRY_DATA_WARNINGS_COLUMNS,
             banner_text=banner_text,
         )
 
@@ -1384,14 +1479,15 @@ def generate_reports(
 
     logger.info(
         "Report generated: %s (ready_to_post=%d, pending_office_mapping=%d, pending_recruiter_review=%d, "
-        "excluded_mobility_support=%d, country_data_issues=%d, "
+        "excluded_mobility_support=%d, no_longer_eligible=%d, country_data_warnings=%d, "
         "posting_results=%d, terminal_already_processed=%d, terminal_in_ready_population=%d).",
         report_path,
         ready_to_post_count,
         pending_office_mapping_count,
         pending_recruiter_review_count,
         excluded_mobility_support_count,
-        len(country_data_issue_rows),
+        no_longer_eligible_count,
+        len(country_data_warning_rows),
         len(posting_results_rows),
         terminal_already_processed,
         terminal_in_ready_population,
@@ -1405,6 +1501,7 @@ def generate_reports(
         "pending_recruiter_review": pending_recruiter_review_count,
         "pending_office_mapping": pending_office_mapping_count,
         "excluded_mobility_support": excluded_mobility_support_count,
+        "no_longer_eligible": no_longer_eligible_count,
         "country_fallback": country_source_counts[SOURCE_CURRENT_LOCATION],
         "go_live_pre_backlog": go_live_pre_backlog_count,
         "go_live_newly_eligible": go_live_newly_eligible_count,

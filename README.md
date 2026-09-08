@@ -99,15 +99,18 @@ A candidate is synced into `benivo.candidates` when, in the source table:
 - the `is_relocation_required` Jobvite custom field is `Yes` or `No`
 
 Once synced, `classification_service.classify()` decides the operational
-status from three inputs only -- `is_relocation_required`, `start_date`,
-`workplace` -- re-evaluated on every run:
+status, re-evaluated on every run. The candidate's current
+`workflow_state` (kept fresh by sync -- see below) is checked first, ahead
+of everything else:
 
-| relocation | start_date | workplace mapped to a Benivo office? | status |
-|---|---|---|---|
-| Yes | present | yes | `READY_TO_POST` |
-| Yes | present | no | `PENDING_OFFICE_MAPPING` |
-| Yes | missing | -- | `PENDING_MISSING_START_DATE` |
-| No / blank / unrecognized | -- | -- | `NEEDS_RECRUITER_REVIEW` |
+| workflow_state | relocation | mobility_support | start_date | workplace mapped to a Benivo office? | status |
+|---|---|---|---|---|---|
+| not `Mobility in process` | -- | -- | -- | -- | `NO_LONGER_ELIGIBLE` |
+| `Mobility in process` | No / blank / unrecognized | -- | -- | -- | `NEEDS_RECRUITER_REVIEW` |
+| `Mobility in process` | Yes | no qualifying selection | -- | -- | `EXCLUDED_MOBILITY_SUPPORT` |
+| `Mobility in process` | Yes | qualifying | missing | -- | `PENDING_MISSING_START_DATE` |
+| `Mobility in process` | Yes | qualifying | present | no | `PENDING_OFFICE_MAPPING` |
+| `Mobility in process` | Yes | qualifying | present | yes | `READY_TO_POST` |
 
 ## Operational statuses
 
@@ -118,12 +121,21 @@ status from three inputs only -- `is_relocation_required`, `start_date`,
 | `PENDING_MISSING_START_DATE` | Relocation required, no start date yet | no |
 | `PENDING_OFFICE_MAPPING` | Relocation required, workplace has no confirmed Benivo office mapping yet | no |
 | `NEEDS_RECRUITER_REVIEW` | Relocation is `No`/blank/unrecognized -- recruiters sometimes get this field wrong, so these candidates stay visible and are re-classified every run | no |
+| `EXCLUDED_MOBILITY_SUPPORT` | In the Mobility workflow, but no qualifying `mobility_support` selection (Relocation/Visa-work-permit/Accommodation) | no |
+| `NO_LONGER_ELIGIBLE` | The candidate's Jobvite `workflow_state` has moved away from `Mobility in process` (Offer rescinded/rejected, Hired, Candidate withdrew, ...) -- confirmed 2026-09-08, see below | no |
 | `POST_FAILED` | Last Benivo attempt failed | no -- freely retried |
 | `POSTED` | Confirmed `SUCCESS` or `ALREADY_EXISTS` in `benivo.post_log` | **yes, the only terminal status** |
 
-A candidate that falls out of the source query entirely (workflow moved on,
-relocation field changed) is removed from `benivo.candidates` -- history
-isn't lost, it still lives in the source table and in `benivo.post_log`.
+**Corrected 2026-09-08:** a candidate whose source row falls out of scope
+(workflow moved on, relocation field changed/disappeared) is **no longer
+removed** from `benivo.candidates`. Its `workflow_state` is refreshed to the
+current source value and its status is set to `NO_LONGER_ELIGIBLE` in
+place -- the row, and its `benivo.post_log` history, are always preserved.
+A successfully `POSTED` candidate is never touched by this transition. As
+a final safety net, `candidate_repository.get_ready_candidates()` (the
+query that actually selects candidates for a real Benivo POST) also
+independently re-verifies the live Jobvite source at selection time, so a
+candidate can never be posted purely because `benivo.candidates` is stale.
 
 ## Policy mapping: Basic -> "Tier 1"
 

@@ -7,6 +7,15 @@ these are stored/compared as raw strings in SQL, so an enum would just add
 an unwrap step everywhere for no practical benefit.
 """
 
+# The one authoritative Jobvite workflow_state value that puts a candidate
+# in Benivo's scope at all -- confirmed source of truth for the entire
+# pipeline (synchronization_service.py, classification_service.py,
+# candidate_repository.py's final posting safety gate, reporting_service.py).
+# Centralized here 2026-09-08 -- previously duplicated as three independent
+# literals (synchronization_service.WORKFLOW_STATE, reporting_service.
+# MOBILITY_WORKFLOW_STATE, and an implicit assumption in classify()).
+MOBILITY_WORKFLOW_STATE = "Mobility in process"
+
 # --- benivo.candidates.benivo_status -----------------------------------------
 PENDING = "PENDING"
 READY_TO_POST = "READY_TO_POST"
@@ -17,14 +26,32 @@ NEEDS_RECRUITER_REVIEW = "NEEDS_RECRUITER_REVIEW"
 # 2026-09-05 to drop a domestic-relocation exclusion this status originally
 # had a sibling for (see app/services/mobility_scope_service.py, the one
 # centralized place this rule lives). Evaluated only for candidates who
-# already passed the is_relocation_required=Yes gate above.
+# already passed the is_relocation_required=Yes gate above. A BUSINESS-scope
+# exclusion: the candidate is still in Jobvite's "Mobility in process"
+# workflow, just doesn't have a qualifying mobility_support selection.
 EXCLUDED_MOBILITY_SUPPORT = "EXCLUDED_MOBILITY_SUPPORT"
+# A SOURCE-eligibility exclusion -- deliberately a different concept from
+# EXCLUDED_MOBILITY_SUPPORT above, confirmed 2026-09-08: the candidate's
+# authoritative Jobvite workflow_state has moved away from
+# MOBILITY_WORKFLOW_STATE entirely (Offer rescinded, Offer rejected, Hired,
+# Candidate withdrew, or any other state) -- Benivo eligibility requires
+# CURRENTLY being in that workflow, not merely having been there once. See
+# synchronization_service.py (sets this instead of deleting the row) and
+# classification_service.classify() (re-affirms it independently every run
+# from the row's own, kept-fresh workflow_state). Never collapsed into
+# EXCLUDED_MOBILITY_SUPPORT -- they answer different questions ("is this
+# candidate still in the pipeline at all" vs "does this in-pipeline
+# candidate want Benivo's support").
+NO_LONGER_ELIGIBLE = "NO_LONGER_ELIGIBLE"
 POSTED = "POSTED"
 POST_FAILED = "POST_FAILED"
 
 # The only terminal candidate status: classification never re-evaluates a
 # POSTED candidate. POST_FAILED is deliberately NOT terminal -- it's
-# freely reclassified (and retryable) every run.
+# freely reclassified (and retryable) every run. NO_LONGER_ELIGIBLE is ALSO
+# deliberately NOT terminal (see classify()'s docstring): a candidate who
+# legitimately returns to MOBILITY_WORKFLOW_STATE must be able to be
+# reclassified normally, not stuck here forever.
 TERMINAL_CANDIDATE_STATUSES = {POSTED}
 
 # --- benivo.post_log.status ---------------------------------------------------

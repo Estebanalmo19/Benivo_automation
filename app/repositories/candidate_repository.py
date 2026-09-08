@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from app import config
 from app.clients.database_client import db_cursor
-from app.models.domain import ACTION_CREATE_USER, TERMINAL_POST_LOG_STATUSES
+from app.models.domain import ACTION_CREATE_USER, MOBILITY_WORKFLOW_STATE, TERMINAL_POST_LOG_STATUSES
 
 # Jobvite raw_payload is the authoritative source for both subqueries below
 # (confirmed with Mobility 2026-09-04) -- both join
@@ -83,6 +83,24 @@ def get_ready_candidates(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     Deterministic, oldest-first, SQL-limited selection of postable
     candidates.
 
+    FINAL POSTING SAFETY GATE (confirmed 2026-09-08, defense in depth):
+    this deliberately does NOT trust benivo.candidates.benivo_status/
+    workflow_state alone. Investigation of application_eid=pP98MxwU (Babak
+    Guliyev) found 438 of 520 benivo.candidates rows cached as
+    READY_TO_POST whose AUTHORITATIVE jv_arrise_data_schema.
+    jobvite_applications.workflow_state had already moved on (Offer
+    rescinded/rejected, Hired, ...) -- stale because
+    synchronization_service.py's UPSERT structurally cannot refresh a row
+    once it leaves MOBILITY_WORKFLOW_STATE (see that module), and
+    synchronization/classification may not have run recently enough to
+    have caught the transition yet (see
+    synchronization_service._MARK_OUT_OF_SCOPE_SQL /
+    classification_service.classify(), the other two layers of this same
+    defense). The EXISTS clause below re-verifies the LIVE source at the
+    exact moment of selection -- the last possible point before a real
+    Benivo Create User call -- so even a fully stale cache, with sync/
+    classify never having run, still cannot select an ineligible candidate.
+
     Go-live gating (see docs/PHASE1_ARCHITECTURE.md's Go-Live section):
     when config.go_live_at() is set, a candidate is only auto-selected if
     benivo.scope_history records it as first seen in the Benivo posting
@@ -106,6 +124,12 @@ def get_ready_candidates(limit: Optional[int] = None) -> List[Dict[str, Any]]:
           AND c.is_relocation_required = 'Yes'
           AND c.application_eid IS NOT NULL
           AND BTRIM(c.application_eid) <> ''
+          AND EXISTS (
+              SELECT 1
+              FROM jv_arrise_data_schema.jobvite_applications j
+              WHERE j.application_eid = c.application_eid
+                AND j.workflow_state = %(mobility_workflow_state)s
+          )
           AND NOT EXISTS (
               SELECT 1
               FROM benivo.post_log pl
@@ -130,6 +154,7 @@ def get_ready_candidates(limit: Optional[int] = None) -> List[Dict[str, Any]]:
         cur.execute(
             query,
             {
+                "mobility_workflow_state": MOBILITY_WORKFLOW_STATE,
                 "create_user_action": ACTION_CREATE_USER,
                 "terminal_statuses": list(TERMINAL_POST_LOG_STATUSES),
                 "go_live_at": go_live_at,
@@ -204,6 +229,31 @@ def get_candidate_by_application_eid(application_eid: str) -> Optional[Dict[str,
         cur.execute(query, {"application_eid": application_eid})
         row = cur.fetchone()
         return dict(row) if row else None
+
+
+def get_source_workflow_state(application_eid: str) -> Optional[str]:
+    """
+    Live read of the AUTHORITATIVE Jobvite workflow_state for one
+    application_eid, straight from jv_arrise_data_schema.jobvite_applications
+    -- deliberately NEVER benivo.candidates.workflow_state, which is a
+    synced snapshot only refreshed while the candidate stays in scope (see
+    synchronization_service.py). Confirmed 2026-09-08: used as the final
+    posting safety gate for the single-candidate UAT override path (see
+    posting_service.validate_uat_candidate()), which bypasses
+    get_ready_candidates()'s bulk EXISTS check entirely and therefore needs
+    the exact same live re-verification on its own. None if the
+    application_eid has no row in the source table at all.
+    """
+    query = """
+        SELECT workflow_state
+        FROM jv_arrise_data_schema.jobvite_applications
+        WHERE application_eid = %(application_eid)s
+    """
+
+    with db_cursor() as cur:
+        cur.execute(query, {"application_eid": application_eid})
+        row = cur.fetchone()
+        return row["workflow_state"] if row else None
 
 
 def update_candidate_after_posting(

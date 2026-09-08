@@ -16,9 +16,18 @@ import psycopg2
 from app import config
 from app.clients import benivo_client
 from app.clients.database_client import transaction
-from app.models.domain import ACTION_CREATE_USER, ACTION_UPDATE_CASE, POST_LOG_STATUS_TO_CANDIDATE_STATUS
+from app.models.domain import (
+    ACTION_CREATE_USER,
+    ACTION_UPDATE_CASE,
+    MOBILITY_WORKFLOW_STATE,
+    POST_LOG_STATUS_TO_CANDIDATE_STATUS,
+)
 from app.repositories import candidate_repository, post_log_repository
-from app.repositories.candidate_repository import get_candidate_by_application_eid, get_ready_candidates
+from app.repositories.candidate_repository import (
+    get_candidate_by_application_eid,
+    get_ready_candidates,
+    get_source_workflow_state,
+)
 from app.repositories.post_log_repository import get_terminal_post_log_application_eids, insert_post_log_row
 from app.services.country_code_service import resolve_iso2 as resolve_country_iso2
 from app.services.home_country_service import resolve_effective_home_country
@@ -105,7 +114,16 @@ def validate_uat_candidate(
     if candidate is None:
         return {"eligible": False, "checks": checks, "candidate": None, "office": None, "summary": None}
 
-    checks["workflow_state_is_mobility_in_process"] = candidate.get("workflow_state") == "Mobility in process"
+    checks["workflow_state_is_mobility_in_process"] = candidate.get("workflow_state") == MOBILITY_WORKFLOW_STATE
+    # FINAL POSTING SAFETY GATE, live re-check (confirmed 2026-09-08,
+    # defense in depth): the check above trusts the CACHED benivo.candidates
+    # .workflow_state, which this path (unlike the bulk get_ready_candidates()
+    # selection) does not otherwise re-verify against the authoritative
+    # source at all. A single-candidate UAT override that skips the bulk
+    # query's own EXISTS clause needs the exact same live re-verification,
+    # or it would remain exactly as vulnerable as the bug this session fixed
+    # (application_eid=pP98MxwU) -- a stale cache alone is never sufficient.
+    checks["source_still_mobility_in_process"] = get_source_workflow_state(application_eid) == MOBILITY_WORKFLOW_STATE
     checks["is_relocation_required_is_yes"] = (candidate.get("is_relocation_required") or "").strip().lower() == "yes"
 
     effective_start_date, start_date_source = resolve_effective_start_date(candidate.get("start_date"), execution_timestamp)

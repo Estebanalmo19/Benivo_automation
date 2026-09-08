@@ -9,11 +9,14 @@ Must run, in order:
   2. BEFORE BENIVO_GO_LIVE_AT is ever set.
 
 What it does: inserts one row per application_eid known from EITHER
-  - benivo.candidates (the current backlog, still in scope), UNION
+  - benivo.candidates (the current backlog, still in scope -- as of
+    2026-09-08 this also includes NO_LONGER_ELIGIBLE rows, since
+    synchronization_service._MARK_OUT_OF_SCOPE_SQL no longer deletes them;
+    they are still a valid pre-go-live application_eid either way), UNION
   - benivo.post_log (every application_eid ever attempted, including ones
-    whose benivo.candidates row has since been deleted by
-    synchronization_service._DELETE_OUT_OF_SCOPE_SQL after they left
-    Mobility)
+    whose benivo.candidates row was deleted by the old, pre-2026-09-08
+    synchronization_service._DELETE_OUT_OF_SCOPE_SQL behavior after they
+    left Mobility -- retained here for any database that predates the fix)
 with first_seen_in_scope_at = NOW() (the backfill run time -- guaranteed
 before go-live, since go-live isn't enabled yet when this runs).
 ON CONFLICT DO NOTHING makes this safe to run more than once.

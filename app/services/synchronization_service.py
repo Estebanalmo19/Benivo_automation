@@ -11,10 +11,11 @@ from typing import Any, Dict
 import psycopg2
 
 from app.clients.database_client import transaction
+from app.models.domain import MOBILITY_WORKFLOW_STATE, NO_LONGER_ELIGIBLE, POSTED
 
 logger = logging.getLogger(__name__)
 
-WORKFLOW_STATE = "Mobility in process"
+WORKFLOW_STATE = MOBILITY_WORKFLOW_STATE
 RELOCATION_FIELD_CODE = "is_relocation_required"
 RELOCATION_VALUES = ("Yes", "No")
 DEFAULT_BENIVO_STATUS = "PENDING"
@@ -190,31 +191,71 @@ WHERE j.workflow_state = %(workflow_state)s
 ON CONFLICT (application_eid) DO NOTHING;
 """
 
-# Removes candidates that no longer belong to the active source universe
-# (workflow_state moved on, relocation field changed/disappeared, or the
-# source row itself disappeared). Membership only -- no readiness judgment,
-# so this stays a synchronization concern, not classification.
-_DELETE_OUT_OF_SCOPE_SQL = """
-DELETE FROM benivo.candidates c
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM jv_arrise_data_schema.jobvite_applications j
-    CROSS JOIN LATERAL jsonb_array_elements(
-        j.raw_payload->'application'->'customField'
-    ) cf
-    WHERE j.application_eid = c.application_eid
-      AND j.workflow_state = %(workflow_state)s
-      AND cf->>'fieldCode' = %(relocation_field_code)s
-      AND cf->>'value' IN %(relocation_values)s
-);
+# Lifecycle transition for candidates that no longer belong to the active
+# source universe (workflow_state moved on, relocation field changed/
+# disappeared) -- REPLACES a prior hard DELETE (confirmed 2026-09-08 to be
+# the wrong behavior: it silently erased the operational/historical record,
+# including for candidates who had already reached READY_TO_POST). The
+# NOT EXISTS predicate is unchanged and identical to _UPSERT_SQL's own WHERE
+# -- the two must never disagree about who's in scope.
+#
+# Instead of deleting, this UPDATEs the row in place:
+#   - workflow_state is refreshed to the candidate's CURRENT Jobvite value
+#     (via the correlated subquery) so the row always reflects reality, even
+#     though the UPSERT above can structurally never reach it again once it
+#     stops matching MOBILITY_WORKFLOW_STATE. If the source row has since
+#     disappeared entirely from jv_arrise_data_schema.jobvite_applications
+#     (rare -- confirmed 0 such rows as of the 2026-09-08 investigation),
+#     the subquery returns NULL and COALESCE preserves the last-known value
+#     rather than overwriting it with a guess.
+#   - benivo_status is set to NO_LONGER_ELIGIBLE -- a SOURCE-eligibility
+#     exclusion, deliberately distinct from EXCLUDED_MOBILITY_SUPPORT (a
+#     BUSINESS-scope exclusion classification_service.py applies to
+#     candidates who ARE still in Jobvite scope) -- see domain.py.
+#   - POSTED is explicitly never touched here: a successfully posted
+#     candidate's workflow moving on afterward (e.g. to "Hired") must never
+#     make them eligible for a duplicate Create User call, and their
+#     terminal historical status must never be overwritten.
+#
+# NOT terminal (see domain.py/classify()): a candidate who legitimately
+# returns to MOBILITY_WORKFLOW_STATE is picked up again by the UPSERT above
+# (which refreshes their other fields once they match again) and then
+# reclassified normally by classification_service.classify() on the next
+# run -- nothing prevents re-entry.
+_MARK_OUT_OF_SCOPE_SQL = """
+UPDATE benivo.candidates c
+SET workflow_state = COALESCE(
+        (
+            SELECT j.workflow_state
+            FROM jv_arrise_data_schema.jobvite_applications j
+            WHERE j.application_eid = c.application_eid
+        ),
+        c.workflow_state
+    ),
+    benivo_status = %(no_longer_eligible_status)s,
+    updated_at = NOW()
+WHERE c.benivo_status IS DISTINCT FROM %(posted_status)s
+  AND NOT EXISTS (
+      SELECT 1
+      FROM jv_arrise_data_schema.jobvite_applications j
+      CROSS JOIN LATERAL jsonb_array_elements(
+          j.raw_payload->'application'->'customField'
+      ) cf
+      WHERE j.application_eid = c.application_eid
+        AND j.workflow_state = %(workflow_state)s
+        AND cf->>'fieldCode' = %(relocation_field_code)s
+        AND cf->>'value' IN %(relocation_values)s
+  );
 """
 
 
 def sync_candidates() -> Dict[str, Any]:
     """
     Refresh benivo.candidates from jv_arrise_data_schema.jobvite_applications:
-    upsert current matches, remove rows no longer in scope. One transaction;
-    rolls back entirely on failure. Contains no business classification.
+    upsert current matches, transition rows no longer in scope to
+    NO_LONGER_ELIGIBLE (never deleted -- see _MARK_OUT_OF_SCOPE_SQL). One
+    transaction; rolls back entirely on failure. Contains no business
+    classification.
     """
     logger.info(
         "Candidate synchronization started "
@@ -226,6 +267,8 @@ def sync_candidates() -> Dict[str, Any]:
         "workflow_state": WORKFLOW_STATE,
         "relocation_field_code": RELOCATION_FIELD_CODE,
         "relocation_values": RELOCATION_VALUES,
+        "no_longer_eligible_status": NO_LONGER_ELIGIBLE,
+        "posted_status": POSTED,
     }
 
     started_at = time.perf_counter()
@@ -235,13 +278,14 @@ def sync_candidates() -> Dict[str, Any]:
             cur.execute(_UPSERT_SQL, params)
             upserted = cur.rowcount
 
-            # Must run BEFORE the delete below and in the same transaction:
-            # this is what makes first_seen_in_scope_at durable across a
-            # candidate leaving and later re-entering scope in-between syncs.
+            # Must run BEFORE the out-of-scope transition below and in the
+            # same transaction: this is what makes first_seen_in_scope_at
+            # durable across a candidate leaving and later re-entering scope
+            # in-between syncs.
             cur.execute(_SCOPE_HISTORY_UPSERT_SQL, params)
 
-            cur.execute(_DELETE_OUT_OF_SCOPE_SQL, params)
-            removed = cur.rowcount
+            cur.execute(_MARK_OUT_OF_SCOPE_SQL, params)
+            marked_no_longer_eligible = cur.rowcount
     except psycopg2.Error:
         duration_seconds = time.perf_counter() - started_at
         logger.exception(
@@ -252,14 +296,14 @@ def sync_candidates() -> Dict[str, Any]:
     duration_seconds = time.perf_counter() - started_at
 
     logger.info(
-        "Candidate synchronization finished: %d row(s) upserted, %d row(s) removed, in %.2fs.",
+        "Candidate synchronization finished: %d row(s) upserted, %d row(s) marked no_longer_eligible, in %.2fs.",
         upserted,
-        removed,
+        marked_no_longer_eligible,
         duration_seconds,
     )
 
     return {
         "inserted_or_updated": upserted,
-        "removed": removed,
+        "marked_no_longer_eligible": marked_no_longer_eligible,
         "duration_seconds": round(duration_seconds, 2),
     }

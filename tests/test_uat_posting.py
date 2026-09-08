@@ -11,6 +11,12 @@ PS = "app.services.posting_service"
 BENIVO_POST = "app.clients.benivo_client.requests.post"
 BENIVO_GET = "app.clients.benivo_client.requests.get"
 
+# Default patch for the FINAL POSTING SAFETY GATE's live source re-check
+# (candidate_repository.get_source_workflow_state(), confirmed 2026-09-08)
+# -- "Mobility in process" for every test that doesn't specifically exercise
+# this new check, matching pre-existing eligible-candidate expectations.
+SOURCE_WORKFLOW_STATE_MOBILITY = patch(f"{PS}.get_source_workflow_state", return_value="Mobility in process")
+
 
 def _eligible_candidate(**overrides):
     base = {
@@ -36,7 +42,8 @@ def _eligible_candidate(**overrides):
 
 def test_validate_uat_candidate_all_conditions_pass():
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is True
@@ -77,7 +84,8 @@ def test_validate_uat_candidate_not_found():
 def test_validate_uat_candidate_wrong_workflow_state():
     candidate = _eligible_candidate(workflow_state="Hired")
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -87,7 +95,8 @@ def test_validate_uat_candidate_wrong_workflow_state():
 def test_validate_uat_candidate_relocation_not_yes():
     candidate = _eligible_candidate(is_relocation_required="No")
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -103,7 +112,8 @@ def test_validate_uat_candidate_missing_jobvite_start_date_is_now_eligible():
     execution_timestamp = datetime.datetime(2026, 8, 6, tzinfo=datetime.timezone.utc)
 
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES}, execution_timestamp=execution_timestamp)
 
     assert result["eligible"] is True
@@ -115,7 +125,8 @@ def test_validate_uat_candidate_missing_jobvite_start_date_is_now_eligible():
 def test_validate_uat_candidate_not_ready_to_post_status():
     candidate = _eligible_candidate(benivo_status="PENDING_MISSING_START_DATE")
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -124,7 +135,8 @@ def test_validate_uat_candidate_not_ready_to_post_status():
 
 def test_validate_uat_candidate_already_has_terminal_post_log_result():
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value={"APP-UAT-1"}):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value={"APP-UAT-1"}), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -134,7 +146,8 @@ def test_validate_uat_candidate_already_has_terminal_post_log_result():
 def test_validate_uat_candidate_office_unresolved():
     candidate = _eligible_candidate(workplace="Some Unmapped Site")
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is False
@@ -143,7 +156,8 @@ def test_validate_uat_candidate_office_unresolved():
 
 def test_validate_uat_candidate_no_refdata_means_office_unresolved():
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.validate_uat_candidate("APP-UAT-1", refdata=None)
 
     assert result["eligible"] is False
@@ -158,7 +172,8 @@ def test_validate_uat_candidate_vip_is_now_eligible():
     # at the time; it is retired along with policy_service.py).
     candidate = _eligible_candidate(is_vip=True)
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is True
@@ -171,12 +186,58 @@ def test_validate_uat_candidate_vip_is_now_eligible():
 def test_validate_uat_candidate_game_presenter_is_eligible():
     candidate = _eligible_candidate(dealer_shuffler="Presenter")
     with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
 
     assert result["eligible"] is True
     assert result["summary"]["population_name"] == "Game Presenters and Shufflers"
     assert result["summary"]["population_api_value"] == "Game Presenters and Shufflers"
+
+
+# ---------------------------------------------------------------------------
+# FINAL POSTING SAFETY GATE, live source re-check (confirmed 2026-09-08,
+# root-caused from application_eid=pP98MxwU / Babak Guliyev): the UAT
+# single-candidate path bypasses get_ready_candidates()'s own bulk EXISTS
+# check entirely, so it needs an equivalent live re-verification of its own.
+# ---------------------------------------------------------------------------
+
+def test_validate_uat_candidate_stale_cache_but_source_still_mobility_is_eligible():
+    # Cached benivo.candidates.workflow_state says Mobility in process AND
+    # the live source agrees -- fully eligible.
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         patch(f"{PS}.get_source_workflow_state", return_value="Mobility in process"):
+        result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
+
+    assert result["eligible"] is True
+    assert result["checks"]["source_still_mobility_in_process"] is True
+
+
+def test_validate_uat_candidate_stale_cache_but_source_moved_on_is_ineligible():
+    # THE CRITICAL CASE: cached benivo.candidates.workflow_state still says
+    # "Mobility in process" (stale), but the live Jobvite source has moved
+    # to "Offer rescinded" -- must be blocked, exactly the pP98MxwU scenario.
+    candidate = _eligible_candidate()  # cached workflow_state == "Mobility in process"
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         patch(f"{PS}.get_source_workflow_state", return_value="Offer rescinded"):
+        result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
+
+    assert result["eligible"] is False
+    assert result["checks"]["workflow_state_is_mobility_in_process"] is True  # cache alone looked fine
+    assert result["checks"]["source_still_mobility_in_process"] is False  # live re-check catches it
+
+
+def test_validate_uat_candidate_source_row_missing_entirely_is_ineligible():
+    candidate = _eligible_candidate()
+    with patch(f"{PS}.get_candidate_by_application_eid", return_value=candidate), \
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         patch(f"{PS}.get_source_workflow_state", return_value=None):
+        result = posting.validate_uat_candidate("APP-UAT-1", refdata={"offices": UAT_OFFICES})
+
+    assert result["eligible"] is False
+    assert result["checks"]["source_still_mobility_in_process"] is False
 
 
 def test_validate_payload_requires_all_fields():
@@ -216,7 +277,8 @@ def test_select_postable_candidates_never_calls_normal_path_when_uat_eid_set(mon
          patch(BENIVO_POST, return_value=token_response), \
          patch(BENIVO_GET, return_value=refdata_response), \
          patch(f"{PS}.get_candidate_by_application_eid", return_value=_eligible_candidate()), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.select_postable_candidates(limit=1)
 
     mock_ready.assert_not_called()
@@ -238,7 +300,8 @@ def test_select_postable_candidates_returns_empty_and_never_falls_back_on_failed
          patch(BENIVO_POST, return_value=token_response), \
          patch(BENIVO_GET, return_value=refdata_response), \
          patch(f"{PS}.get_candidate_by_application_eid", return_value=ineligible_candidate), \
-         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()):
+         patch(f"{PS}.get_terminal_post_log_application_eids", return_value=set()), \
+         SOURCE_WORKFLOW_STATE_MOBILITY:
         result = posting.select_postable_candidates(limit=1)
 
     assert result == []

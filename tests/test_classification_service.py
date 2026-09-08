@@ -5,7 +5,9 @@ import pytest
 
 from app.models.domain import (
     EXCLUDED_MOBILITY_SUPPORT,
+    MOBILITY_WORKFLOW_STATE,
     NEEDS_RECRUITER_REVIEW,
+    NO_LONGER_ELIGIBLE,
     PENDING_OFFICE_MAPPING,
     POSTED,
     READY_TO_POST,
@@ -23,6 +25,11 @@ UNMAPPED_WORKPLACE = "Nonexistent Site"
 # test case below, so those keep asserting exactly what they asserted
 # before mobility_support existed as a gate.
 QUALIFYING_SUPPORT = "Relocation"
+
+# Likewise for workflow_state -- every pre-existing test case below assumes
+# the candidate is currently in Jobvite's Mobility workflow, matching
+# behavior before this gate existed.
+IN_SCOPE_WORKFLOW_STATE = MOBILITY_WORKFLOW_STATE
 
 
 @pytest.mark.parametrize(
@@ -50,7 +57,8 @@ QUALIFYING_SUPPORT = "Relocation"
 )
 def test_classify(relocation_value, start_date, workplace, expected):
     assert classify(
-        relocation_value, start_date, workplace, EXECUTION_TIMESTAMP, mobility_support=QUALIFYING_SUPPORT,
+        relocation_value, start_date, workplace, EXECUTION_TIMESTAMP,
+        mobility_support=QUALIFYING_SUPPORT, workflow_state=IN_SCOPE_WORKFLOW_STATE,
     ) == expected
 
 
@@ -60,7 +68,8 @@ def test_classify_missing_jobvite_start_date_becomes_ready_to_post_not_pending()
     # (via the calculated third-month-after date), never
     # PENDING_MISSING_START_DATE.
     assert classify(
-        "Yes", None, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP, mobility_support=QUALIFYING_SUPPORT,
+        "Yes", None, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support=QUALIFYING_SUPPORT, workflow_state=IN_SCOPE_WORKFLOW_STATE,
     ) == READY_TO_POST
 
 
@@ -72,7 +81,7 @@ def test_posted_is_terminal_and_excluded_from_reclassification():
     "non_terminal_status",
     [
         "PENDING", "READY_TO_POST", "PENDING_MISSING_START_DATE", "PENDING_OFFICE_MAPPING",
-        "NEEDS_RECRUITER_REVIEW", "EXCLUDED_MOBILITY_SUPPORT",
+        "NEEDS_RECRUITER_REVIEW", "EXCLUDED_MOBILITY_SUPPORT", "NO_LONGER_ELIGIBLE",
         "POST_FAILED", None,
     ],
 )
@@ -87,14 +96,15 @@ def test_pending_office_mapping_is_not_terminal_so_new_mappings_are_picked_up():
     # special-casing needed beyond PENDING_OFFICE_MAPPING not being terminal.
     assert is_terminal(PENDING_OFFICE_MAPPING) is False
     assert classify(
-        "Yes", SOME_DATE, UNMAPPED_WORKPLACE, EXECUTION_TIMESTAMP, mobility_support=QUALIFYING_SUPPORT,
+        "Yes", SOME_DATE, UNMAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support=QUALIFYING_SUPPORT, workflow_state=IN_SCOPE_WORKFLOW_STATE,
     ) == PENDING_OFFICE_MAPPING
 
 
 # ---------------------------------------------------------------------------
 # mobility_support eligibility (confirmed 2026-09-04 business rule; the
-# ONLY Benivo scope rule -- corrected 2026-09-05, domestic/local relocation
-# is NOT a general exclusion gate for any country, UAE included).
+# ONLY Benivo BUSINESS scope rule -- corrected 2026-09-05, domestic/local
+# relocation is NOT a general exclusion gate for any country, UAE included).
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -103,19 +113,22 @@ def test_pending_office_mapping_is_not_terminal_so_new_mappings_are_picked_up():
 )
 def test_classify_mobility_support_qualifying_combinations_are_ready(mobility_support):
     assert classify(
-        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP, mobility_support=mobility_support,
+        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support=mobility_support, workflow_state=IN_SCOPE_WORKFLOW_STATE,
     ) == READY_TO_POST
 
 
 def test_classify_mobility_support_na_only_excludes():
     assert classify(
-        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP, mobility_support="N/A",
+        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support="N/A", workflow_state=IN_SCOPE_WORKFLOW_STATE,
     ) == EXCLUDED_MOBILITY_SUPPORT
 
 
 def test_classify_mobility_support_missing_excludes():
     assert classify(
-        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP, mobility_support=None,
+        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support=None, workflow_state=IN_SCOPE_WORKFLOW_STATE,
     ) == EXCLUDED_MOBILITY_SUPPORT
 
 
@@ -124,7 +137,8 @@ def test_classify_mobility_support_checked_before_start_date_and_office():
     # it would otherwise also be PENDING_OFFICE_MAPPING -- mobility_support
     # is checked earlier.
     assert classify(
-        "Yes", SOME_DATE, UNMAPPED_WORKPLACE, EXECUTION_TIMESTAMP, mobility_support="N/A",
+        "Yes", SOME_DATE, UNMAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support="N/A", workflow_state=IN_SCOPE_WORKFLOW_STATE,
     ) == EXCLUDED_MOBILITY_SUPPORT
 
 
@@ -132,7 +146,8 @@ def test_classify_relocation_gate_checked_before_mobility_support():
     # is_relocation_required != Yes still wins over mobility_support --
     # unchanged from the original rule's ordering.
     assert classify(
-        "No", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP, mobility_support="N/A",
+        "No", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support="N/A", workflow_state=IN_SCOPE_WORKFLOW_STATE,
     ) == NEEDS_RECRUITER_REVIEW
 
 
@@ -142,7 +157,8 @@ def test_classify_domestic_relocation_no_longer_excludes():
     # exactly like an international one -- classify() no longer takes a
     # home_country/current_country/domestic-relocation gate at all.
     assert classify(
-        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP, mobility_support=QUALIFYING_SUPPORT,
+        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support=QUALIFYING_SUPPORT, workflow_state=IN_SCOPE_WORKFLOW_STATE,
     ) == READY_TO_POST
 
 
@@ -158,6 +174,63 @@ def test_classify_signature_has_no_domestic_relocation_parameters():
 
 
 # ---------------------------------------------------------------------------
+# Jobvite workflow eligibility (confirmed 2026-09-08 -- Layer 2 of the
+# 3-layer defense: synchronization_service._MARK_OUT_OF_SCOPE_SQL,
+# classification_service.classify() here, candidate_repository.
+# get_ready_candidates()'s own live re-check). Root cause investigated:
+# application_eid=pP98MxwU (Babak Guliyev) stayed READY_TO_POST in
+# benivo.candidates for days after Jobvite moved to "Offer rescinded".
+# ---------------------------------------------------------------------------
+
+def test_classify_workflow_state_not_mobility_is_no_longer_eligible():
+    assert classify(
+        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support=QUALIFYING_SUPPORT, workflow_state="Offer rescinded",
+    ) == NO_LONGER_ELIGIBLE
+
+
+@pytest.mark.parametrize(
+    "workflow_state",
+    ["Offer rescinded", "Offer rejected", "Hired", "Candidate withdrew", "Some Other State", None, ""],
+)
+def test_classify_any_non_mobility_workflow_state_is_no_longer_eligible(workflow_state):
+    assert classify(
+        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support=QUALIFYING_SUPPORT, workflow_state=workflow_state,
+    ) == NO_LONGER_ELIGIBLE
+
+
+def test_classify_workflow_state_checked_before_every_other_rule():
+    # NO_LONGER_ELIGIBLE wins over relocation/mobility_support/office --
+    # confirmed the most authoritative gate, checked first.
+    assert classify(
+        "No", SOME_DATE, UNMAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support="N/A", workflow_state="Offer rescinded",
+    ) == NO_LONGER_ELIGIBLE
+
+
+def test_classify_workflow_state_mobility_in_process_proceeds_normally():
+    assert classify(
+        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP,
+        mobility_support=QUALIFYING_SUPPORT, workflow_state=MOBILITY_WORKFLOW_STATE,
+    ) == READY_TO_POST
+
+
+def test_classify_workflow_state_default_fails_closed():
+    # Matches mobility_support's own convention: no meaningful default,
+    # never silently assumed to mean "still in scope".
+    assert classify(
+        "Yes", SOME_DATE, MAPPED_WORKPLACE, EXECUTION_TIMESTAMP, mobility_support=QUALIFYING_SUPPORT,
+    ) == NO_LONGER_ELIGIBLE
+
+
+def test_no_longer_eligible_is_not_terminal_so_reentry_is_possible():
+    # A candidate who legitimately returns to Mobility in process must be
+    # reclassified normally, not stuck in NO_LONGER_ELIGIBLE forever.
+    assert is_terminal(NO_LONGER_ELIGIBLE) is False
+
+
+# ---------------------------------------------------------------------------
 # classify_candidates() -- DB orchestration
 # ---------------------------------------------------------------------------
 
@@ -169,9 +242,9 @@ def test_classify_candidates_generates_execution_timestamp_once_per_run():
     # proves "generated once per run, reused for every candidate."
     mock_cursor = MagicMock()
     mock_cursor.fetchall.return_value = [
-        {"id": 1, "is_relocation_required": "Yes", "start_date": None, "workplace": MAPPED_WORKPLACE, "mobility_support": QUALIFYING_SUPPORT},
-        {"id": 2, "is_relocation_required": "Yes", "start_date": None, "workplace": MAPPED_WORKPLACE, "mobility_support": QUALIFYING_SUPPORT},
-        {"id": 3, "is_relocation_required": "Yes", "start_date": None, "workplace": MAPPED_WORKPLACE, "mobility_support": QUALIFYING_SUPPORT},
+        {"id": 1, "is_relocation_required": "Yes", "start_date": None, "workplace": MAPPED_WORKPLACE, "workflow_state": IN_SCOPE_WORKFLOW_STATE, "mobility_support": QUALIFYING_SUPPORT},
+        {"id": 2, "is_relocation_required": "Yes", "start_date": None, "workplace": MAPPED_WORKPLACE, "workflow_state": IN_SCOPE_WORKFLOW_STATE, "mobility_support": QUALIFYING_SUPPORT},
+        {"id": 3, "is_relocation_required": "Yes", "start_date": None, "workplace": MAPPED_WORKPLACE, "workflow_state": IN_SCOPE_WORKFLOW_STATE, "mobility_support": QUALIFYING_SUPPORT},
     ]
     mock_cursor.rowcount = 1
 
@@ -194,6 +267,32 @@ def test_classify_candidates_generates_execution_timestamp_once_per_run():
     assert counts[READY_TO_POST] == 3
 
 
+def test_classify_candidates_reclassifies_stale_workflow_state_to_no_longer_eligible():
+    # A row whose CACHED workflow_state already reflects the source's exit
+    # from Mobility in process (i.e. synchronization_service already
+    # refreshed it) is correctly reclassified, even though its OTHER
+    # cached fields (is_relocation_required, workplace) are still stale
+    # "Yes"/mapped values that would otherwise say READY_TO_POST.
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [
+        {"id": 1, "is_relocation_required": "Yes", "start_date": SOME_DATE, "workplace": MAPPED_WORKPLACE, "workflow_state": "Offer rescinded", "mobility_support": QUALIFYING_SUPPORT},
+    ]
+    mock_cursor.rowcount = 1
+
+    class FakeTransaction:
+        def __enter__(self):
+            return mock_cursor
+
+        def __exit__(self, *args):
+            return False
+
+    with patch("app.services.classification_service.transaction", return_value=FakeTransaction()):
+        counts = classification_service.classify_candidates()
+
+    assert counts[NO_LONGER_ELIGIBLE] == 1
+    assert counts[READY_TO_POST] == 0
+
+
 def test_fetch_classifiable_candidates_query_includes_mobility_support_subquery():
     from app.repositories.candidate_repository import MOBILITY_SUPPORT_SUBQUERY
 
@@ -205,6 +304,19 @@ def test_fetch_classifiable_candidates_query_includes_mobility_support_subquery(
     sql, params = mock_cursor.execute.call_args[0]
     assert MOBILITY_SUPPORT_SUBQUERY in sql
     assert params == (POSTED,)
+
+
+def test_fetch_classifiable_candidates_query_selects_workflow_state():
+    # Confirmed 2026-09-08: classify() needs the row's OWN
+    # benivo.candidates.workflow_state (kept fresh by synchronization_service.py)
+    # to detect a candidate who has left Jobvite's Mobility workflow.
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = []
+
+    classification_service._fetch_classifiable_candidates(mock_cursor)
+
+    sql, _params = mock_cursor.execute.call_args[0]
+    assert "c.workflow_state" in sql
 
 
 def test_fetch_classifiable_candidates_query_no_longer_selects_home_or_current_country():

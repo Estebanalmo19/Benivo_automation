@@ -597,7 +597,7 @@ def test_generate_reports_produces_expected_sheet_names(tmp_path, monkeypatch):
     wb = load_workbook(report_path)
     assert set(wb.sheetnames) == {
         "Instructions", "Executive Summary", "Ready To Post", "Posting Results",
-        "Pending Office Mapping", "Pending Recruiter Review", "Country Data Issues", "Payload Preview",
+        "Pending Office Mapping", "Pending Recruiter Review", "Country Data Warnings", "Payload Preview",
         "Go-Live Status",
     }
     assert wb.sheetnames[0] == "Instructions"
@@ -692,10 +692,10 @@ def test_generate_reports_ready_to_post_and_payload_preview_agree_on_readiness(t
     assert preview_rows["READY-1"]["unresolved_office"] is True
 
 
-def test_generate_reports_country_data_issues_sheet_includes_missing_and_fallback(tmp_path, monkeypatch):
+def test_generate_reports_country_data_warnings_sheet_includes_missing_and_fallback(tmp_path, monkeypatch):
     population = [
-        _candidate("READY-NO-COUNTRY-AT-ALL", benivo_status="READY_TO_POST", home_country=None, current_country=None),
-        _candidate("PENDING-NO-HOME-HAS-CURRENT", benivo_status="PENDING_OFFICE_MAPPING", workplace="Unmapped Site", home_country=None, current_country="Belarus"),
+        _candidate("READY-NO-COUNTRY-AT-ALL", benivo_status="READY_TO_POST", home_country=None, current_country=None, mobility_support="Relocation"),
+        _candidate("PENDING-NO-HOME-HAS-CURRENT", benivo_status="PENDING_OFFICE_MAPPING", workplace="Unmapped Site", home_country=None, current_country="Belarus", mobility_support="Relocation"),
         _candidate("READY-WITH-PRIMARY-HOME", benivo_status="READY_TO_POST", home_country="Serbia", current_country="Georgia"),
     ]
     _patch_common(monkeypatch, tmp_path, population)
@@ -703,27 +703,32 @@ def test_generate_reports_country_data_issues_sheet_includes_missing_and_fallbac
     report_path, _metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
 
     wb = load_workbook(report_path)
-    ws = wb["Country Data Issues"]
+    ws = wb["Country Data Warnings"]
     header = [c.value for c in ws[2]]
-    assert header == reporting.COUNTRY_DATA_ISSUES_COLUMNS
+    assert header == reporting.COUNTRY_DATA_WARNINGS_COLUMNS
 
     rows = {row[0]: dict(zip(header, row)) for row in ws.iter_rows(min_row=3, values_only=True)}
 
     # Only the missing and fallback-using candidates appear -- the one with
-    # a primary candidate_home_country is fully clean, not an "issue".
+    # a primary candidate_home_country is fully clean, not a "warning".
     assert set(rows.keys()) == {"READY-NO-COUNTRY-AT-ALL", "PENDING-NO-HOME-HAS-CURRENT"}
 
     missing_row = rows["READY-NO-COUNTRY-AT-ALL"]
     assert missing_row["Country Source"] == "MISSING"
-    assert missing_row["Country Sent to Benivo"] is None
-    assert missing_row["Operational Status"] == "READY_TO_POST"
+    assert missing_row["Effective Home Country"] is None
+    assert missing_row["ISO2"] is None
+    assert missing_row["Benivo Status"] == "READY_TO_POST"
+    assert missing_row["Scope Eligibility"] == "Yes"
 
     fallback_row = rows["PENDING-NO-HOME-HAS-CURRENT"]
     assert fallback_row["Candidate Home Country"] is None
-    assert fallback_row["Current Country"] == "Belarus"
-    assert fallback_row["Country Sent to Benivo"] == "Belarus"
+    assert fallback_row["Current Location"] == "Belarus"
+    assert fallback_row["Effective Home Country"] == "Belarus"
     assert fallback_row["Country Source"] == "CURRENT_LOCATION"
-    assert fallback_row["Operational Status"] == "PENDING_OFFICE_MAPPING"
+    assert fallback_row["ISO2"] == "BY"
+    assert fallback_row["Benivo Status"] == "PENDING_OFFICE_MAPPING"
+    assert fallback_row["Warning Reason"] == reporting.COUNTRY_ISSUE_FALLBACK_REASON
+    assert "does not block Benivo posting" in fallback_row["Warning Reason"]
 
     summary = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
     assert summary["Candidate Home Country"] == "1 (33.3%)"
@@ -731,7 +736,52 @@ def test_generate_reports_country_data_issues_sheet_includes_missing_and_fallbac
     assert summary["Missing"] == "1 (33.3%)"
 
 
-def test_generate_reports_country_data_issues_sheet_absent_when_clean(tmp_path, monkeypatch):
+def test_generate_reports_country_data_warnings_excludes_permanently_excluded_scope(tmp_path, monkeypatch):
+    # Aligned with Benivo scope (confirmed 2026-09-07): a candidate
+    # permanently excluded from scope (EXCLUDED_MOBILITY_SUPPORT) must NOT
+    # appear here even with a country fallback -- fixing their country data
+    # would never make them postable. The old is_relocation_required-based
+    # population would have included this candidate (relocation="Yes");
+    # the corrected population excludes it via benivo_status instead.
+    population = [
+        _candidate(
+            "EXCLUDED-MS-1", is_relocation_required="Yes", benivo_status="EXCLUDED_MOBILITY_SUPPORT",
+            home_country=None, current_country="Serbia", mobility_support="N/A",
+        ),
+    ]
+    _patch_common(monkeypatch, tmp_path, population)
+
+    report_path, _metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    assert "Country Data Warnings" not in wb.sheetnames
+
+
+def test_generate_reports_country_data_warnings_includes_needs_recruiter_review(tmp_path, monkeypatch):
+    # Corrected population is NOT the old is_relocation_required=="Yes"
+    # bucket -- a NEEDS_RECRUITER_REVIEW candidate (relocation not yet
+    # confirmed) with a country fallback is still on track to become
+    # eligible, so it belongs here now (it would have been excluded under
+    # the old relocation_yes-only population).
+    population = [
+        _candidate(
+            "REVIEW-1", is_relocation_required="No", benivo_status="NEEDS_RECRUITER_REVIEW",
+            home_country=None, current_country="Georgia",
+        ),
+    ]
+    _patch_common(monkeypatch, tmp_path, population)
+
+    report_path, _metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    ws = wb["Country Data Warnings"]
+    header = [c.value for c in ws[2]]
+    rows = {row[0]: dict(zip(header, row)) for row in ws.iter_rows(min_row=3, values_only=True)}
+    assert "REVIEW-1" in rows
+    assert rows["REVIEW-1"]["Benivo Status"] == "NEEDS_RECRUITER_REVIEW"
+
+
+def test_generate_reports_country_data_warnings_sheet_absent_when_clean(tmp_path, monkeypatch):
     # Exception-only sheet: no worksheet at all when there's nothing to
     # show, not an empty-with-note sheet -- the KPI in Executive Summary
     # still shows 0 either way.
@@ -741,7 +791,7 @@ def test_generate_reports_country_data_issues_sheet_absent_when_clean(tmp_path, 
     report_path, _metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
 
     wb = load_workbook(report_path)
-    assert "Country Data Issues" not in wb.sheetnames
+    assert "Country Data Warnings" not in wb.sheetnames
 
     summary = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
     assert summary["Missing"] == "0 (0.0%)"
@@ -756,7 +806,7 @@ def test_generate_reports_exception_sheets_absent_when_all_clean(tmp_path, monke
     wb = load_workbook(report_path)
     assert "Pending Office Mapping" not in wb.sheetnames
     assert "Pending Recruiter Review" not in wb.sheetnames
-    assert "Country Data Issues" not in wb.sheetnames
+    assert "Country Data Warnings" not in wb.sheetnames
 
     summary = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
     assert summary["Pending Office Mapping"] == "0 (0.0%)"
@@ -770,15 +820,15 @@ def test_generate_reports_exception_sheets_present_when_nonempty(tmp_path, monke
 
     wb = load_workbook(report_path)
     # _mock_population() has one PENDING_OFFICE_MAPPING candidate (also
-    # missing home_country -> also a Country Data Issue) and two
+    # missing home_country -> also a Country Data Warning) and two
     # NEEDS_RECRUITER_REVIEW candidates -- all three exception sheets must
     # exist and be non-empty.
     assert "Pending Office Mapping" in wb.sheetnames
     assert "Pending Recruiter Review" in wb.sheetnames
-    assert "Country Data Issues" in wb.sheetnames
+    assert "Country Data Warnings" in wb.sheetnames
     assert wb["Pending Office Mapping"].max_row >= 3
     assert wb["Pending Recruiter Review"].max_row >= 3
-    assert wb["Country Data Issues"].max_row >= 3
+    assert wb["Country Data Warnings"].max_row >= 3
     assert "Excluded - Benivo Scope" not in wb.sheetnames  # none excluded in _mock_population()
 
 
@@ -819,6 +869,64 @@ def test_generate_reports_excluded_scope_sheet_present_with_mobility_support_rea
     assert summary["Excluded - Mobility Support"] == "1 (50.0%)"
     assert metrics["excluded_mobility_support"] == 1
     assert "excluded_domestic_relocation" not in metrics
+
+
+def test_generate_reports_no_longer_eligible_excluded_from_ready_to_post(tmp_path, monkeypatch):
+    # Root cause regression guard (application_eid=pP98MxwU / Babak Guliyev,
+    # confirmed 2026-09-08): a NO_LONGER_ELIGIBLE candidate must never
+    # appear on Ready To Post, even though it's still a real, preserved row.
+    population = [
+        _candidate("NLE-1", benivo_status="NO_LONGER_ELIGIBLE", workflow_state="Offer rescinded"),
+        _candidate("READY-1", benivo_status="READY_TO_POST", home_country="Serbia"),
+    ]
+    _patch_common(monkeypatch, tmp_path, population)
+
+    report_path, _metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    ready_eids = [
+        row[0] for row in wb["Ready To Post"].iter_rows(min_row=3, values_only=True)
+    ]
+    assert "NLE-1" not in ready_eids
+    assert "READY-1" in ready_eids
+
+
+def test_generate_reports_no_longer_eligible_appears_in_excluded_scope_sheet(tmp_path, monkeypatch):
+    population = [
+        _candidate("NLE-1", benivo_status="NO_LONGER_ELIGIBLE", workflow_state="Offer rescinded"),
+    ]
+    _patch_common(monkeypatch, tmp_path, population)
+
+    report_path, metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    assert "Excluded - Benivo Scope" in wb.sheetnames
+
+    rows = list(wb["Excluded - Benivo Scope"].iter_rows(min_row=3, values_only=True))
+    eids = [row[0] for row in rows]
+    assert "NLE-1" in eids
+
+    reasons = [cell for row in rows for cell in row if isinstance(cell, str)]
+    assert any("no longer eligible for benivo posting" in r.lower() for r in reasons)
+
+    summary = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
+    assert summary["No Longer Eligible (Jobvite workflow moved on)"] == "1 (100.0%)"
+    assert metrics["no_longer_eligible"] == 1
+
+
+def test_generate_reports_no_longer_eligible_excluded_from_country_data_warnings(tmp_path, monkeypatch):
+    # A NO_LONGER_ELIGIBLE candidate with a missing home country must NOT
+    # clutter Country Data Warnings -- fixing their country data would
+    # never make them postable again on its own.
+    population = [
+        _candidate("NLE-1", benivo_status="NO_LONGER_ELIGIBLE", workflow_state="Offer rescinded", home_country=None, current_country="Romania"),
+    ]
+    _patch_common(monkeypatch, tmp_path, population)
+
+    report_path, _metrics = reporting.generate_reports(selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1")
+
+    wb = load_workbook(report_path)
+    assert "Country Data Warnings" not in wb.sheetnames
 
 
 def test_generate_reports_ready_to_post_includes_country_columns(tmp_path, monkeypatch):
@@ -905,13 +1013,13 @@ def test_generate_reports_sync_metrics_shown_when_provided(tmp_path, monkeypatch
 
     report_path, _metrics = reporting.generate_reports(
         selected_candidates=[], dry_run=True, posting_limit=5, run_id="run-1",
-        sync_metrics={"inserted_or_updated": 12, "removed": 3},
+        sync_metrics={"inserted_or_updated": 12, "marked_no_longer_eligible": 3},
     )
 
     wb = load_workbook(report_path)
     summary = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
     assert summary["Candidates Synced"] == 12
-    assert summary["Candidates Removed"] == 3
+    assert summary["Candidates Marked No Longer Eligible (this sync)"] == 3
 
 
 def test_generate_reports_sync_metrics_shown_as_na_when_absent(tmp_path, monkeypatch):
@@ -922,7 +1030,7 @@ def test_generate_reports_sync_metrics_shown_as_na_when_absent(tmp_path, monkeyp
     wb = load_workbook(report_path)
     summary = {row[0].value: row[1].value for row in wb["Executive Summary"].iter_rows(min_row=2) if row[0].value}
     assert summary["Candidates Synced"] == "N/A (sync not run this execution)"
-    assert summary["Candidates Removed"] == "N/A (sync not run this execution)"
+    assert summary["Candidates Marked No Longer Eligible (this sync)"] == "N/A (sync not run this execution)"
 
 
 def test_generate_reports_executive_summary_has_data_quality_section(tmp_path, monkeypatch):

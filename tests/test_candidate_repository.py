@@ -36,6 +36,65 @@ def test_get_ready_candidates_applies_no_go_live_filter_when_unset():
     assert params["go_live_at"] is None
 
 
+# ---------------------------------------------------------------------------
+# FINAL POSTING SAFETY GATE (confirmed 2026-09-08, root-caused from
+# application_eid=pP98MxwU / Babak Guliyev): get_ready_candidates() must
+# re-verify the authoritative Jobvite source at selection time, never trust
+# benivo.candidates.benivo_status/workflow_state alone.
+# ---------------------------------------------------------------------------
+
+def test_get_ready_candidates_requires_live_source_workflow_state_match():
+    context_manager, cursor = _fake_db_cursor()
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager), \
+         patch("app.repositories.candidate_repository.config.go_live_at", return_value=None):
+        candidate_repository.get_ready_candidates(limit=1)
+
+    sql, params = cursor.execute.call_args[0]
+    assert "jv_arrise_data_schema.jobvite_applications" in sql
+    assert "j.workflow_state = %(mobility_workflow_state)s" in sql
+    assert "j.application_eid = c.application_eid" in sql
+    assert params["mobility_workflow_state"] == "Mobility in process"
+
+
+def test_get_ready_candidates_still_requires_cached_ready_to_post_status():
+    # The live source check is ADDITIONAL, not a replacement for the
+    # existing benivo_status gate.
+    context_manager, cursor = _fake_db_cursor()
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager), \
+         patch("app.repositories.candidate_repository.config.go_live_at", return_value=None):
+        candidate_repository.get_ready_candidates(limit=1)
+
+    sql, _params = cursor.execute.call_args[0]
+    assert "c.benivo_status = 'READY_TO_POST'" in sql
+
+
+def test_get_source_workflow_state_reads_live_source_only():
+    rows = [{"workflow_state": "Offer rescinded"}]
+    context_manager, cursor = _fake_db_cursor(rows)
+    cursor.fetchone.return_value = rows[0]
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        result = candidate_repository.get_source_workflow_state("pP98MxwU")
+
+    sql, params = cursor.execute.call_args[0]
+    assert "jv_arrise_data_schema.jobvite_applications" in sql
+    assert "benivo.candidates" not in sql
+    assert params == {"application_eid": "pP98MxwU"}
+    assert result == "Offer rescinded"
+
+
+def test_get_source_workflow_state_none_when_source_row_missing():
+    context_manager, cursor = _fake_db_cursor()
+    cursor.fetchone.return_value = None
+
+    with patch("app.repositories.candidate_repository.db_cursor", return_value=context_manager):
+        result = candidate_repository.get_source_workflow_state("does-not-exist")
+
+    assert result is None
+
+
 def test_get_scope_history_map_returns_application_eid_keyed_dict():
     rows = [
         {"application_eid": "APP-1", "first_seen_in_scope_at": "2026-01-01"},

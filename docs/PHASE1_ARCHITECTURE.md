@@ -210,11 +210,19 @@ application/candidate creation date, since candidates can apply months
 before entering Mobility. The design must also survive a candidate leaving
 Mobility and re-entering later.
 
-**Why not a column on `benivo.candidates`:** `synchronization_service.
-_DELETE_OUT_OF_SCOPE_SQL` permanently deletes a candidate's row the moment
-they leave scope. A `first_seen_at` column on that row would be lost the
-instant the candidate leaves and re-enters, incorrectly making a
-pre-existing candidate look brand new.
+**Why not a column on `benivo.candidates`:** originally, `synchronization_
+service._DELETE_OUT_OF_SCOPE_SQL` permanently deleted a candidate's row the
+moment they left scope. A `first_seen_at` column on that row would have
+been lost the instant the candidate left and re-entered, incorrectly making
+a pre-existing candidate look brand new. **Corrected 2026-09-08:**
+out-of-scope candidates are no longer deleted at all -- `synchronization_
+service._MARK_OUT_OF_SCOPE_SQL` now transitions the row to
+`NO_LONGER_ELIGIBLE` in place instead (see that module and
+`app/models/domain.py`). `benivo.scope_history` remains necessary anyway:
+it is the only reliable `first_seen_in_scope_at` record for any candidate
+whose row WAS deleted-and-reinserted under the old (pre-2026-09-08)
+behavior, and it stays immune to any future regression of this kind by
+design (see migrations/0008's trigger).
 
 **Design: a separate, append-only `benivo.scope_history` table**
 (`migrations/0008_add_scope_history_table.sql`, not yet applied):
