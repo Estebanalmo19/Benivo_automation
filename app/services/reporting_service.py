@@ -264,6 +264,7 @@ PAYLOAD_PREVIEW_COLUMNS = [
     "create_officeId",
     "create_officeName",
     "create_startDateOfAssignment",
+    "create_gender",
     # Case PATCH payload preview (== posting_service.build_case_update_payload())
     "case_caseId_available",
     "case_hostJobRole",
@@ -733,6 +734,10 @@ def _build_payload_preview_row(
         "create_officeId": create_payload.get("officeId"),
         "create_officeName": create_payload.get("officeName"),
         "create_startDateOfAssignment": create_payload.get("startDateOfAssignment"),
+        # Gender only -- deliberately NOT create_phoneNumber here: phone is
+        # already shown above (raw "phone_number") and business explicitly
+        # asked not to expand phone's reporting footprint without need.
+        "create_gender": create_payload.get("gender"),
         "case_caseId_available": case_id if case_id is not None else CASE_ID_PENDING_LABEL,
         "case_hostJobRole": case_data.get("hostJobRole"),
         "case_home_country": effective_home_country,

@@ -31,8 +31,10 @@ from app.repositories.candidate_repository import (
 from app.repositories.post_log_repository import get_terminal_post_log_application_eids, insert_post_log_row
 from app.services.approved_batch_service import select_approved_batch_candidates
 from app.services.country_code_service import resolve_iso2 as resolve_country_iso2
+from app.services.gender_service import resolve_gender
 from app.services.home_country_service import resolve_effective_home_country
 from app.services.office_resolution_service import resolve_office
+from app.services.phone_service import normalize_phone_number
 from app.services.population_service import resolve_population_values
 from app.services.start_date_service import resolve_effective_start_date
 from app.utils.helpers import mask_email
@@ -294,11 +296,25 @@ def build_benivo_payload(
     an unconfirmed integration contract. See app/services/reporting_service.py
     for where this value is currently surfaced instead (data-prepared,
     API-disabled).
+
+    phoneNumber / gender: CONFIRMED 2026-09-11+ via official Benivo API
+    documentation -- both are optional Create User fields (phoneNumber:
+    "Primary Identification and Contact Information"; gender: "Demographics",
+    accepted values Female/Male/Other). Unlike agency_name above, both the
+    source (candidate.get("phone_number")/candidate.get("gender")) and the
+    destination contract are now confirmed, so both are included here --
+    but only conditionally, via phone_service.normalize_phone_number() and
+    gender_service.resolve_gender(), which each fail safely to None (key
+    omitted entirely, never sent as null/blank/guessed) rather than send an
+    unconfirmed or invented value. See those modules for the exact rules:
+    phone never gets a guessed country code, and gender's "Undefined"
+    (Jobvite's own not-answered value) is never mapped to Benivo's real
+    "Other" value.
     """
     _, population_api_value = resolve_population_values(candidate.get("dealer_shuffler"), candidate.get("is_vip"))
     effective_home_country, _home_country_source = resolve_effective_home_country(candidate)
 
-    return {
+    payload = {
         "firstName": candidate.get("first_name"),
         "lastName": candidate.get("last_name"),
         "email": candidate.get("email"),
@@ -308,6 +324,16 @@ def build_benivo_payload(
         "startDateOfAssignment": _format_start_date(effective_start_date),
         "homeCountry": effective_home_country,
     }
+
+    phone_number = normalize_phone_number(candidate.get("phone_number"))
+    if phone_number is not None:
+        payload["phoneNumber"] = phone_number
+
+    gender = resolve_gender(candidate.get("gender"))
+    if gender is not None:
+        payload["gender"] = gender
+
+    return payload
 
 
 def build_case_update_payload(candidate: Dict[str, Any], case_id: Any) -> Dict[str, Any]:

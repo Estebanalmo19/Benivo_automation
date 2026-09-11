@@ -1097,33 +1097,87 @@ def test_build_benivo_payload_never_includes_agency_name():
 
 
 # ---------------------------------------------------------------------------
-# build_benivo_payload() / build_case_update_payload() -- phone_number and
-# gender are deliberately NEVER sent (confirmed 2026-09-11, UAT feedback
-# investigation): no Benivo Create User or Case PATCH field name has been
-# confirmed for either. phone_number was already stored/unsent before this
-# investigation; gender is newly captured (synchronization_service.py) as
-# Jobvite-side data preparation only, same unconfirmed-destination status as
-# agency_name. This must hold even when the candidate dict carries real
-# values for both, so the real Benivo payloads stay byte-for-byte unchanged.
+# build_benivo_payload() -- phoneNumber/gender (confirmed 2026-09-11+ via
+# official Benivo API documentation, Create User only): included ONLY when
+# phone_service.normalize_phone_number()/gender_service.resolve_gender()
+# resolve to a non-None value -- see those modules for the exact rules.
+# Base confirmed key set (firstName/lastName/email/policy/officeId/
+# officeName/startDateOfAssignment/homeCountry) must never change shape.
+# build_case_update_payload() is untouched -- phone/gender are user-profile
+# fields, not Case fields, and must never appear there under any name.
 # ---------------------------------------------------------------------------
 
-def test_build_benivo_payload_never_includes_phone_or_gender():
+BASE_CREATE_USER_KEYS = {
+    "firstName", "lastName", "email", "policy", "officeId", "officeName",
+    "startDateOfAssignment", "homeCountry",
+}
+
+
+def test_build_benivo_payload_both_phone_and_gender_valid_both_included():
     candidate = {
         "first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False,
-        "phone_number": "+1234567890", "gender": "Male",
+        "phone_number": "+44 7700 900123", "gender": "Female",
     }
     office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
 
     payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
 
-    # The exact currently-confirmed Create User keys -- no phone/gender key
-    # under any name, and neither value leaks into any other field.
-    assert set(payload.keys()) == {
-        "firstName", "lastName", "email", "policy", "officeId", "officeName",
-        "startDateOfAssignment", "homeCountry",
+    assert set(payload.keys()) == BASE_CREATE_USER_KEYS | {"phoneNumber", "gender"}
+    assert payload["phoneNumber"] == "+447700900123"
+    assert payload["gender"] == "Female"
+
+
+def test_build_benivo_payload_only_gender_valid_phone_omitted():
+    candidate = {
+        "first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False,
+        "phone_number": "0721123456", "gender": "Male",
     }
-    assert "+1234567890" not in payload.values()
-    assert "Male" not in payload.values()
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    assert set(payload.keys()) == BASE_CREATE_USER_KEYS | {"gender"}
+    assert payload["gender"] == "Male"
+    assert "phoneNumber" not in payload
+
+
+def test_build_benivo_payload_only_phone_valid_gender_omitted():
+    candidate = {
+        "first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False,
+        "phone_number": "+40-721-123-456", "gender": "Undefined",
+    }
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    assert set(payload.keys()) == BASE_CREATE_USER_KEYS | {"phoneNumber"}
+    assert payload["phoneNumber"] == "+40721123456"
+    assert "gender" not in payload
+
+
+def test_build_benivo_payload_neither_valid_original_key_set_unchanged():
+    candidate = {
+        "first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False,
+        "phone_number": None, "gender": "Undefined",
+    }
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    assert set(payload.keys()) == BASE_CREATE_USER_KEYS
+    assert "phoneNumber" not in payload
+    assert "gender" not in payload
+
+
+def test_build_benivo_payload_missing_phone_and_gender_keys_entirely_unchanged():
+    # Candidate dict without these keys at all (e.g. older/partial fixtures)
+    # must behave identically to explicit None -- never raise, never guess.
+    candidate = {"first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False}
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    assert set(payload.keys()) == BASE_CREATE_USER_KEYS
 
 
 def test_build_case_update_payload_never_includes_phone_or_gender():
