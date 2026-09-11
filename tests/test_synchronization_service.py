@@ -234,3 +234,41 @@ def test_upsert_sql_agency_name_blank_source_becomes_null_not_empty_string():
 
     assert "NULLIF(" in case_expr
     assert "->>'source', ''" in case_expr
+
+
+# ---------------------------------------------------------------------------
+# gender (confirmed 2026-09-11, UAT feedback investigation): source-owned,
+# extracted from application.gender (a native attribute, not a customField).
+# Deliberately NOT normalized ("Undefined" included as-is) and NOT sent to
+# Benivo -- same unconfirmed-destination status as agency_name -- see
+# posting_service.build_benivo_payload()/build_case_update_payload().
+# ---------------------------------------------------------------------------
+
+def test_upsert_sql_inserts_and_refreshes_gender():
+    sql = synchronization_service._UPSERT_SQL
+
+    insert_columns = sql.split("INSERT INTO benivo.candidates (")[1].split(")")[0]
+    assert "gender" in insert_columns
+    assert "gender = EXCLUDED.gender" in sql.split("DO UPDATE SET")[1]
+
+
+def test_upsert_sql_gender_sourced_from_application_gender_not_a_custom_field():
+    # Must read the native application.gender attribute directly -- not a
+    # customField extraction (no jsonb_array_elements/fieldCode lookup),
+    # since no gender/sex/pronoun customField was found anywhere in the
+    # source data during the 2026-09-11 investigation.
+    sql = synchronization_service._UPSERT_SQL
+    select_expr = sql.split("AS gender")[0].split(",\n")[-1]
+
+    assert "raw_payload->'application'->>'gender'" in select_expr
+
+
+def test_upsert_sql_gender_does_not_normalize_undefined_value():
+    # "Undefined" is Jobvite's own value for an unfilled EEO-style field
+    # (same category as veteranStatus/race) -- it must be stored as-is, not
+    # NULLed out or mapped, until Benivo's accepted values are confirmed.
+    sql = synchronization_service._UPSERT_SQL
+    select_expr = sql.split("AS gender")[0].split(",\n")[-1]
+
+    assert "NULLIF" not in select_expr
+    assert "CASE" not in select_expr

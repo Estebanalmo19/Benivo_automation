@@ -1094,3 +1094,52 @@ def test_build_benivo_payload_never_includes_agency_name():
         "startDateOfAssignment", "homeCountry",
     }
     assert "Randstad Romania" not in payload.values()
+
+
+# ---------------------------------------------------------------------------
+# build_benivo_payload() / build_case_update_payload() -- phone_number and
+# gender are deliberately NEVER sent (confirmed 2026-09-11, UAT feedback
+# investigation): no Benivo Create User or Case PATCH field name has been
+# confirmed for either. phone_number was already stored/unsent before this
+# investigation; gender is newly captured (synchronization_service.py) as
+# Jobvite-side data preparation only, same unconfirmed-destination status as
+# agency_name. This must hold even when the candidate dict carries real
+# values for both, so the real Benivo payloads stay byte-for-byte unchanged.
+# ---------------------------------------------------------------------------
+
+def test_build_benivo_payload_never_includes_phone_or_gender():
+    candidate = {
+        "first_name": "Jane", "last_name": "Doe", "email": "j@example.com", "is_vip": False,
+        "phone_number": "+1234567890", "gender": "Male",
+    }
+    office = {"officeId": "id-1", "officeName": "Serbia (Live Casino)"}
+
+    payload = posting.build_benivo_payload(candidate, office, datetime.date(2026, 1, 1))
+
+    # The exact currently-confirmed Create User keys -- no phone/gender key
+    # under any name, and neither value leaks into any other field.
+    assert set(payload.keys()) == {
+        "firstName", "lastName", "email", "policy", "officeId", "officeName",
+        "startDateOfAssignment", "homeCountry",
+    }
+    assert "+1234567890" not in payload.values()
+    assert "Male" not in payload.values()
+
+
+def test_build_case_update_payload_never_includes_phone_or_gender():
+    candidate = {
+        "job_title": "Game Presenter", "home_country": "Serbia",
+        "phone_number": "+1234567890", "gender": "Male",
+    }
+
+    payload = posting.build_case_update_payload(candidate, case_id=1010644)
+
+    assert payload == {
+        "findBy": {"caseId": 1010644},
+        "data": {
+            "hostJobRole": "Game Presenter",
+            "homeLocation": {"country": "RS"},
+        },
+    }
+    assert "+1234567890" not in str(payload)
+    assert "Male" not in str(payload)

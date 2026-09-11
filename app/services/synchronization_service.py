@@ -88,6 +88,22 @@ DEFAULT_BENIVO_STATUS = "PENDING"
 #     reporting for recruiting agencies; the Benivo-side destination field
 #     is not yet confirmed (see posting_service.py), this is the Jobvite/
 #     data-model half only.
+#   gender        <- application.gender (a native Jobvite application
+#     attribute -- same category as veteranStatus/race -- NOT a
+#     customField). Confirmed 2026-09-11 while investigating UAT feedback:
+#     values across all Jobvite applications are a clean 3-value set
+#     (Male/Female/Undefined, no free text) with no separate gender/sex/
+#     pronoun customField anywhere (application- or job-level). Stored
+#     as-is, INCLUDING "Undefined" -- per the same "never normalize until
+#     the destination's accepted values are known" rule agency_name and
+#     every other field in this UPSERT already follow, "Undefined" is
+#     Jobvite's own value, not a blank to be NULLed out. The benivo.
+#     candidates.gender column already existed (pre-dates this UPSERT,
+#     see legacy/legacy_candidate_upsert.py) but was never populated by
+#     this active sync. Same status as agency_name: Jobvite-side data
+#     preparation only -- Benivo has not confirmed a destination field, so
+#     this is NOT sent in build_benivo_payload()/build_case_update_payload()
+#     (see posting_service.py).
 # host_country, host_city, population, vip have NO confirmed source field
 # anywhere in jv_arrise_data_schema.jobvite_applications (application
 # customFields, job customFields, and top-level candidate/application keys
@@ -112,6 +128,7 @@ INSERT INTO benivo.candidates (
     current_country,
     is_vip,
     agency_name,
+    gender,
     source_payload,
     benivo_status,
     updated_at
@@ -161,6 +178,7 @@ SELECT
         THEN NULLIF(j.raw_payload->'application'->>'source', '')
         ELSE NULL
     END AS agency_name,
+    j.raw_payload->'application'->>'gender' AS gender,
     j.raw_payload,
     %(default_status)s,
     NOW()
@@ -190,6 +208,7 @@ DO UPDATE SET
     current_country = EXCLUDED.current_country,
     is_vip = EXCLUDED.is_vip,
     agency_name = EXCLUDED.agency_name,
+    gender = EXCLUDED.gender,
     source_payload = EXCLUDED.source_payload,
     updated_at = NOW();
 """
